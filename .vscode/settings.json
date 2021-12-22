@@ -1,0 +1,21 @@
+{
+    "files.associations": {
+        "*.json": "json",
+        "*.s": "gas",
+        "memlib.h": "c",
+        "mm.h": "c",
+        "functional": "c",
+        "*.tcc": "c",
+        "array": "c",
+        "bitset": "c",
+        "string_view": "c",
+        "initializer_list": "c",
+        "utility": "c",
+        "atomic": "c",
+        "cstdint": "c",
+        "random": "c"
+    },
+    "editor.rulers": [
+        80
+    ]
+}
