@@ -66,16 +66,18 @@
 typedef void Payload;
 typedef uint32_t Word;
 typedef Word BoundaryTag;
+typedef BoundaryTag Header;
+typedef BoundaryTag Footer;
 typedef Word UnalignedPayloadSize;
 typedef Word PayloadSize;
 typedef Word BlockSize;
 typedef Word UnalignedBlockSize;
 
-#define HEADER_SIZE sizeof(BoundaryTag)
-#define FOOTER_SIZE sizeof(BoundaryTag)
+#define HEADER_SIZE sizeof(Header)
+#define FOOTER_SIZE sizeof(Footer)
 
 typedef struct {
-  BoundaryTag header;
+  Header header;
   /*
    * We don't know what the size of the payload will be, so we will
    * declare it as a zero-length array.  This allow us to obtain a
@@ -83,7 +85,7 @@ typedef struct {
    **/
   uint8_t payload[];
   // As we don't know payload size here, we need to manually get the footer.
-  // BoundaryTag footer;
+  // Footer footer;
 } Block;
 
 /*
@@ -94,14 +96,15 @@ typedef Block UninitBlock;
 typedef enum {
   FREE = 0x0,
   ALLOCATED = 0x1,
-  // PREVIOUS_FREE = 0x2, // TODO: remove footers from allocated blocks
+  FREE_AND_PREVIOUS_FREE = 0x2,
+  ALLOCATED_AND_PREVIOUS_FREE = 0x3,
 } BlockState;
 
 static Block *first_block;
 static Block *last_block;
 static Word blocks_size;
 
-#define is_block_state(maybe_state) (maybe_state) >= 0 && (maybe_state) <= 1
+#define is_block_state(maybe_state) (maybe_state) >= 0 && (maybe_state) <= 2
 
 #define is_aligned(word) ((word) & ~(-ALIGNMENT)) == 0
 
@@ -194,25 +197,34 @@ static inline const PayloadSize get_payload_size(__NotNull Block *block) {
   return payload_size;
 }
 
-static inline __NotNull BoundaryTag *get_footer(__NotNull Block *block) {
-  debug_assert(block != NULL);
+static inline __NotNull Footer *
+get_footer_from_payload_size(__NotNull Block *block,
+                             const PayloadSize payload_size) {
+  debug_assert(is_block(block));
+  debug_assert(is_payload_size(payload_size));
 
-  PayloadSize payload_size = get_payload_size(block);
-  BoundaryTag *footer = shift_right(block, HEADER_SIZE + payload_size);
+  Footer *footer = shift_right(block, HEADER_SIZE + payload_size);
 
   debug_assert(footer != NULL);
   return footer;
 }
 
-static inline const BlockState extract_block_state(const BoundaryTag tag) {
-  return tag & ~PAYLOAD_SIZE_MASK;
+static inline __NotNull BoundaryTag *get_footer(__NotNull Block *block) {
+  debug_assert(is_block(block));
+
+  const PayloadSize payload_size = get_payload_size(block);
+  return get_footer_from_payload_size(block, payload_size);
 }
 
-static inline const BlockState get_block_state(__NotNull Block *block) {
+static inline const BlockState extract_header_state(const Header header) {
+  return header & ~PAYLOAD_SIZE_MASK;
+}
+
+static inline const BlockState get_state(__NotNull Block *block) {
   debug_assert(block != NULL);
 
   const BoundaryTag header = block->header;
-  const BlockState state = extract_block_state(header);
+  const BlockState state = header & ~PAYLOAD_SIZE_MASK;
 
   debug_assert(is_block_state(state));
   return state;
@@ -223,7 +235,7 @@ static inline const BlockState get_block_state(__NotNull Block *block) {
   __Unused const PayloadSize name##_payload_size =                             \
     extract_payload_size(block->header);                                       \
   __Unused const BlockState name##_block_state =                               \
-    extract_block_state(block->header);                                        \
+    extract_header_state(block->header);                                       \
   __Unused const Payload *name##_payload = get_payload(block);
 #else
 #define GET_BLOCK_SNAPSHOT(name, block)
@@ -236,8 +248,8 @@ static inline const BoundaryTag with_payload_size(const BoundaryTag tag,
   return (tag & ~PAYLOAD_SIZE_MASK) | size;
 }
 
-static inline void set_payload_size(__NotNull Block *block,
-                                    const PayloadSize payload_size) {
+static inline void set_header_payload_size(__NotNull Block *block,
+                                           const PayloadSize payload_size) {
   debug_assert(block != NULL);
   debug_assert(is_payload_size(payload_size));
 
@@ -245,9 +257,22 @@ static inline void set_payload_size(__NotNull Block *block,
 
   BoundaryTag *header = &block->header;
   *header = with_payload_size(*header, payload_size);
-  // Its important to do this in that order, because get_footer uses payload
-  // size from header to calculate footer position.
-  BoundaryTag *footer = get_footer(block);
+
+  GET_BLOCK_SNAPSHOT(new, block);
+  debug_assert(new_payload_size == payload_size);
+  debug_assert(old_block_state == new_block_state);
+  debug_assert(compare_payloads(old_payload, new_payload, old_payload_size));
+}
+
+static inline void set_payload_size(__NotNull Block *block,
+                                    const PayloadSize payload_size) {
+  debug_assert(block != NULL);
+  debug_assert(is_payload_size(payload_size));
+
+  GET_BLOCK_SNAPSHOT(old, block);
+
+  set_header_payload_size(block, payload_size);
+  Footer *footer = get_footer_from_payload_size(block, payload_size);
   *footer = with_payload_size(*footer, payload_size);
 
   GET_BLOCK_SNAPSHOT(new, block);
@@ -256,24 +281,21 @@ static inline void set_payload_size(__NotNull Block *block,
   debug_assert(compare_payloads(old_payload, new_payload, old_payload_size));
 }
 
-static inline const BoundaryTag with_block_state(const BoundaryTag tag,
+static inline const BoundaryTag with_block_state(const Header header,
                                                  const BlockState state) {
   debug_assert(is_block_state(state));
 
-  return (tag & PAYLOAD_SIZE_MASK) | state;
+  return (header & PAYLOAD_SIZE_MASK) | state;
 }
 
-static inline void set_block_state(__NotNull Block *block,
-                                   const BlockState state) {
-  debug_assert(block != NULL);
+static inline void set_state(__NotNull Block *block, const BlockState state) {
+  debug_assert(is_block(block));
   debug_assert(is_block_state(state));
 
   GET_BLOCK_SNAPSHOT(old, block);
 
-  BoundaryTag *header = &block->header;
+  Header *header = &block->header;
   *header = with_block_state(*header, state);
-  BoundaryTag *footer = get_footer(block);
-  *footer = with_block_state(*footer, state);
 
   GET_BLOCK_SNAPSHOT(new, block);
   debug_assert(new_block_state == state);
@@ -282,35 +304,35 @@ static inline void set_block_state(__NotNull Block *block,
 }
 
 static inline bool is_free(__NotNull Block *block) {
-  debug_assert(block != NULL);
+  debug_assert(is_block(block));
 
-  return get_block_state(block) == FREE;
+  return get_state(block) == FREE;
 }
 
 static inline bool is_allocated(__NotNull Block *block) {
-  debug_assert(block != NULL);
+  debug_assert(is_block(block));
 
-  return get_block_state(block) == ALLOCATED;
+  return get_state(block) == ALLOCATED;
 }
 
 static inline void set_free(__NotNull Block *block) {
-  debug_assert(block != NULL);
+  debug_assert(is_block(block));
 
-  set_block_state(block, FREE);
+  set_state(block, FREE);
 
-  debug_assert(get_block_state(block) == FREE);
+  debug_assert(get_state(block) == FREE);
 }
 
 static inline void set_allocated(__NotNull Block *block) {
-  debug_assert(block != NULL);
+  debug_assert(is_block(block));
 
-  set_block_state(block, ALLOCATED);
+  set_state(block, ALLOCATED);
 
-  debug_assert(get_block_state(block) == ALLOCATED);
+  debug_assert(get_state(block) == ALLOCATED);
 }
 
 static inline const BlockSize get_block_size(__NotNull Block *block) {
-  debug_assert(block != NULL);
+  debug_assert(is_block(block));
 
   const PayloadSize payload_size = get_payload_size(block);
   const BlockSize block_size = payload_to_block_size(payload_size);
@@ -446,7 +468,7 @@ allocate_new_block(const BlockSize block_size, const PayloadSize payload_size) {
   UninitBlock *uninit_block = (UninitBlock *)allocated_space;
   debug_assert(is_uninit_block(uninit_block));
 
-  set_payload_size(uninit_block, payload_size);
+  set_header_payload_size(uninit_block, payload_size);
   set_allocated(uninit_block);
 
   Block *block = uninit_block;
@@ -575,7 +597,7 @@ get_previous_footer(__NotNull Block *block) {
   debug_assert(extract_payload_size(*previous_footer) ==
                get_payload_size(previous_block));
   debug_assert(extract_block_state(*previous_footer) ==
-               get_block_state(previous_block));
+               get_state(previous_block));
 
   return previous_footer;
 }
@@ -716,7 +738,7 @@ static inline void print_block(const int verbosity, __NotNull Block *block) {
   debug_assert(is_block(block));
 
   const PayloadSize header_payload_size = get_payload_size(block);
-  const BlockState header_state = get_block_state(block);
+  const BlockState header_state = get_state(block);
   Payload *payload = get_payload(block);
   printf("[%p] | (%x) Size: %u; State: %u |\n", block, block->header,
          header_payload_size, header_state);
