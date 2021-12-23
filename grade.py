@@ -87,29 +87,30 @@ def runtrace(trace):
         "--", "./mdriver", "-f", trace],
         capture_output=True, timeout=TIMEOUT)
 
-    print(mdriver.stdout.decode())
-    if mdriver.returncode:
-        if mdriver.returncode < 0:
-            signame = signal.Signals(-mdriver.returncode).name
-            print("Your solution has been terminated by %s!" % signame)
-        sys.exit(1)
+    output = mdriver.stdout.decode()
+    print(output)
+
+    if any(line.startswith('ERROR') for line in output.splitlines()):
+        raise SystemExit("Your solution is incorrect - check messages above!")
+
+    if mdriver.returncode < 0:
+        signame = signal.Signals(-mdriver.returncode).name
+        raise SystemExit(f"Your solution has been terminated by {signame}!")
+
+    if mdriver.returncode > 0:
+        raise SystemExit(f"Your solution has exited abnormally "
+                         f"with status {mdriver.returncode}!")
 
     # Process statistics from mdriver
     stats = mdriver.stdout.decode().splitlines()[3][4:].split()
     try:
         util = float(stats[1][:-1])
-    except ValueError:
-        util = 0.0
-
-    try:
         used = int(stats[2])
-    except ValueError:
-        used = math.inf
-
-    try:
         total = int(stats[3])
     except ValueError:
-        total = math.inf
+        print(stats)
+        raise SystemExit("Reading statistics from 'mdriver' has failed :( "
+                         "This is a bug - please report it!")
 
     annotate = subprocess.run([
         "callgrind_annotate", "--tree=calling", "callgrind.out"],
