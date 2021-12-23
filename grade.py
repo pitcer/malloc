@@ -131,15 +131,37 @@ def runtrace(trace):
     return util, insn, used, total
 
 
-if __name__ == '__main__':
+def check_symbols():
     nm = subprocess.run(['nm', '-g', '--defined-only', 'mm.o'],
                         stdout=subprocess.PIPE)
-    for line in nm.stdout.decode('utf-8').splitlines():
+    for line in nm.stdout.decode().splitlines():
         symbol = line.split()[-1]
         if symbol not in STUDENT_DEFINED:
             print(f'Symbol "{symbol}" in "mm.o" cannot be visible externally!')
-            print("Your solution was disqualified! :(")
-            sys.exit(1)
+            raise SystemExit("Your solution was disqualified! :(")
+
+
+def check_sections():
+    objdump = subprocess.run(['objdump', '-h', 'mm.o'],
+                             stdout=subprocess.PIPE)
+
+    data_size = 0
+    for line in objdump.stdout.decode().splitlines()[5::2]:
+        fs = line.split()
+        if fs[1] in ['.data', '.bss']:
+          data_size += int(fs[2], 16)
+
+    threshold = 128
+    if data_size >= threshold:
+        print(f"Your solution stores too much data ({data_size} bytes) "
+              f"in '.data' and '.bss' sections.")
+        print(f"Please move top level data definitions into heap header!")
+        raise SystemExit("Your solution was disqualified! :(")
+
+
+if __name__ == '__main__':
+    check_symbols()
+    check_sections()
 
     all_ops = []
     all_insn = []
