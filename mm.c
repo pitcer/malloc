@@ -576,10 +576,12 @@ static inline void print_block(Block block, const int verbosity) {
          is_allocated(block), is_previous_allocated(block));
   printf("      [%p] | ", payload);
 
-  Word length =
-    verbosity < 4
-      ? 0
-      : verbosity < 5 && header_payload_size > 32 ? 32 : header_payload_size;
+  Word length = header_payload_size;
+  if (verbosity < 4) {
+    length = 0;
+  } else if (verbosity < 5 && header_payload_size > 32) {
+    length = 32;
+  }
 
   for (size_t index = 0; index < length; index++) {
     Payload *shifted_payload = shift_right(payload, index);
