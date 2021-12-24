@@ -13,7 +13,13 @@
         "utility": "c",
         "atomic": "c",
         "cstdint": "c",
-        "random": "c"
+        "random": "c",
+        "hash_map": "c",
+        "deque": "c",
+        "list": "c",
+        "string": "c",
+        "vector": "c",
+        "iterator": "c"
     },
     "editor.rulers": [
         80
