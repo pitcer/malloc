@@ -459,6 +459,28 @@ static inline void set_allocated(UninitBlock block) {
   set_allocated_property(block, true);
 }
 
+static inline AllocatedBlock initialize_allocated_block(UninitBlock block,
+                                                        const BlockSize size) {
+  debug_assert(is_uninit_block(block));
+
+  set_allocated(block);
+  set_allocated_uninit_block_size(block, size);
+
+  debug_assert(is_allocated_block(block));
+  return block;
+}
+
+static inline FreeBlock initialize_free_block(UninitBlock block,
+                                              const BlockSize size) {
+  debug_assert(is_uninit_block(block));
+
+  set_free(block);
+  set_free_uninit_block_size(block, size);
+
+  debug_assert(is_free_block(block));
+  return block;
+}
+
 static inline void set_next_allocated_property(Block block, const bool value) {
   debug_assert(is_block(block));
 
@@ -727,16 +749,11 @@ static inline __Nullable Payload allocate_new_block(const BlockSize size) {
   }
 
   UninitBlock uninit_block = (UninitBlock)allocated_space;
-  debug_assert(is_uninit_block(uninit_block));
 
-  set_allocated(uninit_block);
-  set_allocated_uninit_block_size(uninit_block, size);
+  AllocatedBlock block = initialize_allocated_block(uninit_block, size);
   // We call this function if all blocks were allocated, so previous must be
   // allocated.
   set_previous_allocated(uninit_block);
-
-  AllocatedBlock block = uninit_block;
-  debug_assert(is_allocated_block(block));
 
   last_block = block;
 
@@ -804,12 +821,10 @@ static inline Payload allocate_with_split(FreeBlock block,
   UninitBlock empty_uninit_block = shift_right(allocated_block, size);
   debug_assert(is_uninit_block(empty_uninit_block));
 
-  set_free(empty_uninit_block);
-  set_free_uninit_block_size(empty_uninit_block, empty_block_size);
-  set_previous_allocated(empty_uninit_block);
+  FreeBlock empty_block =
+    initialize_free_block(empty_uninit_block, empty_block_size);
+  set_previous_allocated(empty_block);
 
-  FreeBlock empty_block = empty_uninit_block;
-  debug_assert(is_free_block(empty_block));
   debug_assert(shift_right(block, old_block_size - FOOTER_SIZE) ==
                get_footer(empty_block));
 
