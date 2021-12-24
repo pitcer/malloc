@@ -835,16 +835,12 @@ static inline Payload allocate_with_split(FreeBlock block,
   return payload;
 }
 
-/**
- * Malloc
- */
-void *malloc(size_t unaligned_payload_size) {
-  debug_assert(unaligned_payload_size < MAX_HEAP);
+static inline Payload allocate(UnalignedPayloadSize size) {
+  debug_assert(size < MAX_HEAP);
 
   const UnalignedBlockSize unaligned_block_size =
-    unaligned_payload_to_block_size(unaligned_payload_size);
+    unaligned_payload_to_block_size(size);
   const BlockSize block_size = round_to_alignment(unaligned_block_size);
-  // const PayloadSize payload_size = block_to_payload_size(block_size);
 
   // This is the first allocation.
   if (heap_has_no_allocated_blocks()) {
@@ -870,8 +866,18 @@ void *malloc(size_t unaligned_payload_size) {
 
   // Last block was allocated, so we need to allocate a new one.
   __Nullable Payload payload = allocate_new_block(block_size);
-  debug(check_heap(MALLOC, unaligned_payload_size););
   return payload;
+}
+
+/**
+ * Malloc
+ */
+void *malloc(size_t size) {
+  void *result = allocate(size);
+
+  debug(check_heap(MALLOC, size););
+
+  return result;
 }
 
 static inline Footer *get_previous_footer(Block block) {
@@ -914,14 +920,7 @@ static inline AllocatedBlock get_block_from_payload(Payload payload) {
   return block;
 }
 
-/**
- * Free
- */
-void free(void *payload) {
-  if (payload == NULL) {
-    return;
-  }
-
+static inline void deallocate(Payload payload) {
   AllocatedBlock block = get_block_from_payload(payload);
   BlockSize block_size = get_block_size(block);
 
@@ -951,24 +950,32 @@ void free(void *payload) {
 
   set_free(block);
   set_free_block_size(block, block_size);
+}
+
+/**
+ * Free
+ */
+void free(void *ptr) {
+  if (ptr == NULL) {
+    return;
+  }
+
+  deallocate(ptr);
+
   debug(check_heap(FREE, 0););
 }
 
-/*
- * realloc - Change the size of the block by mallocing a new block,
- *      copying its data, and freeing the old block.
- **/
-void *realloc(void *old_payload, size_t size) {
-  /* If size == 0 then this is just free, and we return NULL. */
-  if (size == 0) {
-    free(old_payload);
-    return NULL;
+static inline Payload reallocate(Payload old_payload,
+                                 UnalignedPayloadSize size) {
+  Block block = get_block_from_payload(old_payload);
+  size_t old_size = get_payload_size(block);
+
+  if (size == old_size) {
+    return old_payload;
   }
 
-  /* If old_payload is NULL, then this is just malloc. */
-  if (old_payload == NULL) {
-    return malloc(size);
-  }
+  // TODO: poszerzanie bloku
+  // TODO: zmniejszanie bloku
 
   // jeśli «ptr» nie jest równy «NULL», to musiał zostać zwrócony przez
   // procedurę «mm_malloc» lub
@@ -985,8 +992,6 @@ void *realloc(void *old_payload, size_t size) {
   }
 
   /* Copy the old data. */
-  Block block = get_block_from_payload(old_payload);
-  size_t old_size = get_payload_size(block);
   if (size < old_size) {
     old_size = size;
   }
@@ -994,8 +999,30 @@ void *realloc(void *old_payload, size_t size) {
 
   /* Free the old block. */
   free(old_payload);
-  debug(check_heap(REALLOC, size););
+
   return new_payload;
+}
+
+/**
+ * realloc - Change the size of the block by mallocing a new block,
+ *      copying its data, and freeing the old block.
+ */
+void *realloc(void *old_ptr, size_t size) {
+  /* If size == 0 then this is just free, and we return NULL. */
+  if (size == 0) {
+    free(old_ptr);
+    return NULL;
+  }
+
+  /* If old_payload is NULL, then this is just malloc. */
+  if (old_ptr == NULL) {
+    return malloc(size);
+  }
+
+  void *result = reallocate(old_ptr, size);
+
+  debug(check_heap(REALLOC, size););
+  return result;
 }
 
 /*
