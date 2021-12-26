@@ -558,14 +558,31 @@ static inline __Nullable Block maybe_get_next_block(Block block) {
   }
 
 #ifdef DEBUG
-static inline void print_block(Block block, const int verbosity) {
+
+#define color(color) "\e[48;5;" color "m"
+#define GREEN "34"
+#define RED "88"
+#define RESET "\e[0m"
+
+static inline void print_block(Block block, const uint32_t index,
+                               const int verbosity) {
   debug_assert(blocks_size > 0);
   debug_assert(is_block(block));
 
   const BlockSize header_block_size = get_block_size(block);
   if (verbosity < 3) {
-    printf("%u; ", header_block_size);
+    if (is_free(block)) {
+      printf(color(GREEN) "%u" RESET "; ", header_block_size);
+    } else {
+      printf(color(RED) "%u" RESET "; ", header_block_size);
+    }
     return;
+  }
+
+  if (index > 0) {
+    printf("%.4u: ", index);
+  } else {
+    printf("      ");
   }
 
   const PayloadSize header_payload_size = get_payload_size(block);
@@ -614,11 +631,15 @@ static inline void check_invariants() {
       block, __Nullable Block next = maybe_get_next_block(block);
       if (next != NULL) {
         if (is_allocated(block) != is_previous_allocated(next)) {
-          print_block(block, 3);
-          print_block(next, 3);
+          print_block(block, 0, 4);
+          print_block(next, 0, 4);
         }
         debug_assert(is_allocated(block) == is_previous_allocated(next));
       });
+
+    iterate_blocks(
+      block, __Nullable Block next = maybe_get_next_block(block);
+      if (is_free(block) && next != NULL) { debug_assert(!is_free(next)); })
   }
 }
 
@@ -639,32 +660,39 @@ static inline void put_operation_name(OperationType operation, char **name) {
   }
 }
 
-static inline void check_heap(OperationType operation, size_t size) {
-  check_invariants();
-
+static inline void check_heap(OperationType operation, void *input_payload,
+                              size_t size, void *output_payload) {
   if (verbosity == 0) {
+    check_invariants();
     return;
   }
 
   if (blocks_size == 0) {
-    printf("There are no blocks.\n");
+    debug_msg("There are no blocks.\n");
+    check_invariants();
     return;
   }
 
   char *operation_name[8];
   put_operation_name(operation, operation_name);
 
-  debug(printf("%s %lu (%u): ", *operation_name, size, operation_counter););
+  debug_msg("%s ", *operation_name);
+  if (operation != MALLOC) {
+    debug_msg("%p ", input_payload);
+  }
+  if (operation != FREE) {
+    debug_msg("%lu -> %p ", size, output_payload);
+  }
+  debug_msg("(%u): ", operation_counter);
+
   if (verbosity > 1) {
-    printf("\n");
+    debug_msg("\n");
   }
 
-  uint32_t index = 0;
+  uint32_t index = 1;
   iterate_blocks(
-    block, if (verbosity > 1) {
-      printf("%.4u: ", index);
-      print_block(block, verbosity);
-    } index++;);
+    block,
+    if (verbosity > 1) { print_block(block, index, verbosity); } index++;);
   if (verbosity == 2) {
     printf("\n");
   }
@@ -675,6 +703,8 @@ static inline void check_heap(OperationType operation, size_t size) {
   }
 
   debug(operation_counter++;);
+
+  check_invariants();
 }
 #endif
 
@@ -875,9 +905,11 @@ static inline Payload allocate(UnalignedPayloadSize size) {
  * Malloc
  */
 void *malloc(size_t size) {
+  debug(if (verbosity > 1) { debug_trace("malloc %lu", size); });
+
   void *result = allocate(size);
 
-  debug(check_heap(MALLOC, size););
+  debug(check_heap(MALLOC, NULL, size, result););
 
   return result;
 }
@@ -962,47 +994,192 @@ void free(void *ptr) {
     return;
   }
 
+  debug(if (verbosity > 1) { debug_trace("free %p", ptr); });
+
   deallocate(ptr);
 
-  debug(check_heap(FREE, 0););
+  debug(check_heap(FREE, ptr, 0, NULL););
+}
+
+static inline void reallocate_shrink_with_split(AllocatedBlock block,
+                                                const BlockSize old_size,
+                                                const BlockSize size) {
+  debug_assert(is_allocated_block(block));
+  debug_assert(is_block_size(old_size));
+  debug_assert(is_block_size(size));
+  debug_assert(old_size > size);
+
+  BlockSize empty_block_size = old_size - size;
+  debug_assert(is_block_size(empty_block_size));
+
+  // Block is too small to split, so its size stays the same.
+  if (empty_block_size < MINIMUM_BLOCK_SIZE) {
+    return;
+  }
+
+  UninitBlock empty_uninit_block = shift_right(block, size);
+
+  __Nullable Block next = maybe_get_next_block(block);
+
+  if (next != NULL) {
+    if (is_free(next)) {
+      empty_block_size += get_block_size(next);
+      if (next == last_block) {
+        last_block = empty_uninit_block;
+      }
+    } else {
+      set_previous_free(next);
+    }
+  } else {
+    last_block = empty_uninit_block;
+  }
+
+  set_allocated_block_size(block, size);
+
+  FreeBlock empty_block =
+    initialize_free_block(empty_uninit_block, empty_block_size);
+  set_previous_allocated(empty_block);
+}
+
+static inline void reallocate_extend_with_split(AllocatedBlock block,
+                                                FreeBlock next,
+                                                const BlockSize block_size,
+                                                const BlockSize next_size,
+                                                const BlockSize new_size) {
+  debug_assert(is_allocated_block(block));
+  debug_assert(is_free_block(next));
+  debug_assert(is_block_size(block_size));
+  debug_assert(is_block_size(next_size));
+  debug_assert(is_block_size(new_size));
+  debug_assert(block_size + next_size >= new_size);
+
+  BlockSize empty_block_size = block_size + next_size - new_size;
+  debug_assert(is_block_size(empty_block_size));
+
+  // Block is too small to split, so its size stays the same.
+  if (empty_block_size < MINIMUM_BLOCK_SIZE) {
+    set_allocated_block_size(block, new_size);
+
+    __Nullable Block next_next = maybe_get_next_block(next);
+    if (next_next == NULL) {
+      last_block = block;
+      return;
+    }
+
+    set_previous_allocated(next_next);
+    return;
+  }
+
+  UninitBlock empty_uninit_block = shift_right(block, new_size);
+  FreeBlock empty_block =
+    initialize_free_block(empty_uninit_block, empty_block_size);
+  set_previous_allocated(empty_block);
+
+  if (next == last_block) {
+    last_block = empty_uninit_block;
+  }
+
+  set_allocated_block_size(block, new_size);
+}
+
+static inline const SbrkResult reallocate_with_extend(AllocatedBlock block,
+                                                      const BlockSize old_size,
+                                                      const BlockSize size) {
+  debug_assert(is_allocated_block(block));
+  debug_assert(is_block_size(old_size));
+  debug_assert(is_block_size(size));
+  debug_assert(size > old_size);
+
+  const BlockSize additional_space = size - old_size;
+
+  const SbrkResult result = allocate_heap_space(additional_space);
+  if (result == NULL) {
+    return NULL;
+  }
+
+  set_allocated_block_size(block, size);
+
+  return result;
 }
 
 static inline Payload reallocate(Payload old_payload,
                                  UnalignedPayloadSize size) {
-  Block block = get_block_from_payload(old_payload);
-  size_t old_size = get_payload_size(block);
+  debug_assert(size < MAX_HEAP);
 
-  if (size == old_size) {
+  const UnalignedBlockSize unaligned_block_size =
+    unaligned_payload_to_block_size(size);
+  const BlockSize block_size = round_to_alignment(unaligned_block_size);
+
+  AllocatedBlock block = get_block_from_payload(old_payload);
+  debug_assert(is_allocated_block(block));
+
+  BlockSize old_block_size = get_block_size(block);
+
+  if (block_size == old_block_size) {
     return old_payload;
   }
 
-  // TODO: poszerzanie bloku
-  // TODO: zmniejszanie bloku
+  if (block_size < old_block_size) {
+    reallocate_shrink_with_split(block, old_block_size, block_size);
+    return old_payload;
+  }
 
-  // jeśli «ptr» nie jest równy «NULL», to musiał zostać zwrócony przez
-  // procedurę «mm_malloc» lub
-  // «mm_realloc», i należy zmienić rozmiar przydzielonego bloku. Dopuszcza się
-  // przeniesienie bloku pod nowy adres różny od «ptr». Jeśli użytkownik
-  // zwiększa rozmiar bloku, to dodatkowa pamięć w bloku musi pozostać
-  // niezainicjowana.
+  __Nullable Block next = maybe_get_next_block(block);
 
-  Payload new_payload = malloc(size);
+  // Reallocated block is the last one.
+  if (next == NULL) {
+    debug_assert(block == last_block);
+    debug_assert(shift_right(block, get_block_size(block) - 1) ==
+                 mem_heap_hi());
+
+    const SbrkResult result =
+      reallocate_with_extend(block, old_block_size, block_size);
+    if (result == NULL) {
+      return NULL;
+    }
+
+    return old_payload;
+  }
+
+  if (is_free(next)) {
+    const BlockSize next_size = get_block_size(next);
+
+    if (old_block_size + next_size >= block_size) {
+      reallocate_extend_with_split(block, next, old_block_size, next_size,
+                                   block_size);
+      return old_payload;
+    }
+
+    // Next free block is too small, so check if it is the last block.
+    if (next == last_block) {
+      const SbrkResult result =
+        reallocate_with_extend(block, old_block_size + next_size, block_size);
+      if (result == NULL) {
+        return NULL;
+      }
+
+      last_block = block;
+      return old_payload;
+    }
+  }
+
+  // Next block is allocated, so we don't have enough space to allocate.
+
+  Payload payload = allocate(size);
 
   /* If malloc() fails, the original block is left untouched. */
-  if (new_payload == NULL) {
+  if (payload == NULL) {
     return NULL;
   }
 
+  PayloadSize payload_size = block_to_payload_size(old_block_size);
   /* Copy the old data. */
-  if (size < old_size) {
-    old_size = size;
-  }
-  memcpy(new_payload, old_payload, old_size);
+  memcpy(payload, old_payload, payload_size);
 
   /* Free the old block. */
-  free(old_payload);
+  deallocate(old_payload);
 
-  return new_payload;
+  return payload;
 }
 
 /**
@@ -1021,9 +1198,12 @@ void *realloc(void *old_ptr, size_t size) {
     return malloc(size);
   }
 
+  debug(if (verbosity > 1) { debug_trace("realloc %p %lu", old_ptr, size); });
+
   void *result = reallocate(old_ptr, size);
 
-  debug(check_heap(REALLOC, size););
+  debug(check_heap(REALLOC, old_ptr, size, result););
+
   return result;
 }
 
@@ -1047,4 +1227,5 @@ void *calloc(size_t nmemb, size_t size) {
  */
 void mm_checkheap(int verbose) {
   debug(verbosity = verbose;);
+  // I prefer to call check heap after an operation.
 }

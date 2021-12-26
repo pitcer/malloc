@@ -19,7 +19,8 @@
         "list": "c",
         "string": "c",
         "vector": "c",
-        "iterator": "c"
+        "iterator": "c",
+        "valarray": "c"
     },
     "editor.rulers": [
         80
