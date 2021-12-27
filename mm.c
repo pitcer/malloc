@@ -125,6 +125,8 @@ static Block last_block;
 static Word blocks_size;
 static Cursor root;
 static NodeAddress root_address;
+static Cursor tail;
+static NodeAddress tail_address;
 debug(static uint32_t verbosity = 0;);
 debug(static uint32_t operation_counter = 1;);
 
@@ -1078,6 +1080,10 @@ static inline const NullableBlock find_first_free_block(const BlockSize size) {
 
 static inline const Payload allocate_new_block(const BlockSize size) {
   debug_assert(is_block_size(size));
+
+  // if (is_small_size(size)) {
+    
+  // }
 
   const RawBlock raw_block = new_raw_block(size);
   if (raw_block == NULL) {
