@@ -137,17 +137,8 @@ debug(static uint32_t operation_counter = 1;);
 
 #define ALLOCATED_PROPERTY 0
 #define PREVIOUS_ALLOCATED_PROPERTY 1
-#define SMALL_BLOCKS_AREA_PROPERTY 2
 
 static const NodeAddress EMPTY_NODE_ADDRESS = 0;
-
-// Based on observation that most blocks have size less than 128.
-#define MAXIMUM_SMALL_BLOCK_SIZE 128
-#define SMALL_BLOCKS_AREA_SIZE 4096
-
-static inline const bool is_small_size(const BlockSize size) {
-  return size <= MAXIMUM_SMALL_BLOCK_SIZE;
-}
 
 #define shift_right(pointer, offset) (void *)(pointer) + (offset)
 
@@ -249,10 +240,6 @@ static inline const bool is_allocated(const Block block) {
 
 static inline const bool is_free(const Block block) {
   return !is_allocated(block);
-}
-
-static inline const bool is_small_blocks_area(const Block block) {
-  return get_property(block, SMALL_BLOCKS_AREA_PROPERTY);
 }
 
 static inline const bool is_previous_allocated(const Block block) {
@@ -542,13 +529,6 @@ static inline void set_allocated(const Block block) {
   set_allocated_property(block, true);
 }
 
-static inline void set_small_blocks_area_property(const Block block,
-                                                  const bool value) {
-  debug_assert(is_any_block(block));
-
-  set_property(block, SMALL_BLOCKS_AREA_PROPERTY, value);
-}
-
 static inline void set_previous_allocated_property(const Block block,
                                                    const bool value) {
   debug_assert(is_any_block(block));
@@ -768,8 +748,6 @@ static inline const FreeBlock find_first_free_node(const BlockSize size) {
   iterate_nodes(
     cursor, const FreeBlock block = current_item(cursor);
     const BlockSize item_size = get_free_block_size(block);
-    /* if (is_small_size(size) && is_small_blocks_area(from_free(block)) &&
-        item_size >= size) { return block; } else */
     if (item_size >= size) { return block; });
 
   return NULL;
@@ -1120,10 +1098,6 @@ static inline const NullableBlock find_first_free_block(const BlockSize size) {
 
 static inline const Payload allocate_new_block(const BlockSize size) {
   debug_assert(is_block_size(size));
-
-  // if (is_small_size(size)) {
-
-  // }
 
   const RawBlock raw_block = new_raw_block(size);
   if (raw_block == NULL) {
