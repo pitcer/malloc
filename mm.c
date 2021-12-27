@@ -40,7 +40,6 @@
 #endif
 
 #define __Unused __attribute__((unused))
-#define __Deprecated __attribute__((deprecated))
 
 /* do not change the following! */
 #ifdef DRIVER
@@ -50,14 +49,6 @@
 #define realloc mm_realloc
 #define calloc mm_calloc
 #endif /* def DRIVER */
-
-// Annotations for developer
-
-/**
- * Indicates that variable, function parameter or function result may be equal
- * to NULL.
- */
-#define __Nullable
 
 #define MINIMUM_BLOCK_SIZE ALIGNMENT
 
@@ -143,10 +134,18 @@ debug(static uint32_t operation_counter = 1;);
 #define PROPERTIES_SIZE 3
 
 #define ALLOCATED_PROPERTY 0
-#define NEXT_ALLOCATED_PROPERTY 1
-#define PREVIOUS_ALLOCATED_PROPERTY 2
+#define PREVIOUS_ALLOCATED_PROPERTY 1
+#define SMALL_BLOCKS_AREA_PROPERTY 2
 
 static const NodeAddress EMPTY_NODE_ADDRESS = 0;
+
+// Based on observation that most blocks have size less than 128.
+#define MAXIMUM_SMALL_BLOCK_SIZE 128
+#define SMALL_BLOCKS_AREA_SIZE 4096
+
+static inline const bool is_small_size(const BlockSize size) {
+  return size <= MAXIMUM_SMALL_BLOCK_SIZE;
+}
 
 #define shift_right(pointer, offset) (void *)(pointer) + (offset)
 
@@ -250,12 +249,8 @@ static inline const bool is_free(const Block block) {
   return !is_allocated(block);
 }
 
-static inline const bool is_next_allocated(const Block block) {
-  return get_property(block, NEXT_ALLOCATED_PROPERTY);
-}
-
-static inline const bool is_next_free(const Block block) {
-  return !is_next_allocated(block);
+static inline const bool is_small_blocks_area(const Block block) {
+  return get_property(block, SMALL_BLOCKS_AREA_PROPERTY);
 }
 
 static inline const bool is_previous_allocated(const Block block) {
@@ -266,11 +261,11 @@ static inline const bool is_previous_free(const Block block) {
   return !is_previous_allocated(block);
 }
 
-static inline const bool is_free_block(const __Nullable Block block) {
+static inline const bool is_free_block(const Block block) {
   return is_any_block(block) && is_free(block);
 }
 
-static inline const bool is_allocated_block(const __Nullable Block block) {
+static inline const bool is_allocated_block(const Block block) {
   return is_any_block(block) && is_allocated(block);
 }
 
@@ -545,23 +540,11 @@ static inline void set_allocated(const Block block) {
   set_allocated_property(block, true);
 }
 
-static inline void set_next_allocated_property(const Block block,
-                                               const bool value) {
+static inline void set_small_blocks_area_property(const Block block,
+                                                  const bool value) {
   debug_assert(is_any_block(block));
 
-  set_property(block, NEXT_ALLOCATED_PROPERTY, value);
-}
-
-static inline void set_next_free(const Block block) {
-  debug_assert(is_any_block(block));
-
-  set_next_allocated_property(block, false);
-}
-
-static inline void set_next_allocated(const Block block) {
-  debug_assert(is_any_block(block));
-
-  set_next_allocated_property(block, true);
+  set_property(block, SMALL_BLOCKS_AREA_PROPERTY, value);
 }
 
 static inline void set_previous_allocated_property(const Block block,
@@ -648,10 +631,6 @@ static inline const FreeBlock front() {
   return root;
 }
 
-// static inline const FreeBlock back() {
-//   return NULL;
-// }
-
 static inline const Cursor move_next(const Cursor cursor) {
   debug_assert(is_cursor(cursor));
   const NodeAddress next = cursor->next;
@@ -689,20 +668,6 @@ static inline void push_front(const FreeBlock item) {
   cursor->previous = EMPTY_NODE_ADDRESS;
   set_root(cursor);
 }
-// static inline void pop_front() {
-// }
-// static inline void push_back() {
-// }
-// static inline void pop_back() {
-// }
-
-// static inline void insert_after(const Cursor cursor, const FreeBlock item) {
-//   debug_assert(is_cursor(cursor));
-// }
-
-// static inline void insert_before(const Cursor cursor, const FreeBlock item) {
-//   debug_assert(is_cursor(cursor));
-// }
 
 /**
  * Removes current element.
@@ -745,28 +710,6 @@ static inline void remove_current(const Cursor cursor) {
   }
 }
 
-// const Cursor item_cursor = new_cursor(item);
-// const NodeAddress item_address = cursor_to_node_address(item_cursor);
-// item_cursor->next = EMPTY_NODE_ADDRESS;
-// item_cursor->previous = EMPTY_NODE_ADDRESS;
-
-// if (!is_null_node_address(previous_address)) {
-//   const Cursor previous_cursor = move_previous(cursor);
-//   previous_cursor->next = item_address;
-//   item_cursor->previous = previous_address;
-// }
-
-// if (!is_null_node_address(next_address)) {
-//   const Cursor next_cursor = move_next(cursor);
-//   next_cursor->previous = item_address;
-//   item_cursor->next = next_address;
-// }
-
-// if (is_root_cursor(cursor)) {
-//   debug_assert(test_is_root_cursor(cursor));
-//   set_root(item_cursor);
-// }
-
 #define iterate_nodes(cursor, handler)                                         \
   {                                                                            \
     for (; !is_null_node_address(cursor->next); cursor = move_next(cursor)) {  \
@@ -785,6 +728,8 @@ static inline const FreeBlock find_first_free_node(const BlockSize size) {
   iterate_nodes(
     cursor, const FreeBlock block = current_item(cursor);
     const BlockSize item_size = get_free_block_size(block);
+    /* if (is_small_size(size) && is_small_blocks_area(from_free(block)) &&
+        item_size >= size) { return block; } else */
     if (item_size >= size) { return block; });
 
   return NULL;
@@ -857,7 +802,7 @@ static inline const FreeBlock initialize_free_block(const RawBlock raw_block,
   set_free_raw_block_size(raw_block, size);
 
   const FreeBlock free_block = into_free(block);
-  // push_front(free_block);
+  push_front(free_block);
 
   return free_block;
 }
@@ -1079,7 +1024,7 @@ static inline void check_heap(OperationType operation, void *input_payload,
  * Allocates new uninitialized block. Returns NULL if allocation
  * fails.
  */
-static inline const __Nullable RawBlock new_raw_block(const BlockSize size) {
+static inline const RawBlock new_raw_block(const BlockSize size) {
   debug_assert(is_block_size(size));
 
   const MemoryLocation result = mem_sbrk(size);
@@ -1131,11 +1076,10 @@ static inline const NullableBlock find_first_free_block(const BlockSize size) {
   return NULL;
 }
 
-static inline const __Nullable Payload
-allocate_new_block(const BlockSize size) {
+static inline const Payload allocate_new_block(const BlockSize size) {
   debug_assert(is_block_size(size));
 
-  const __Nullable RawBlock raw_block = new_raw_block(size);
+  const RawBlock raw_block = new_raw_block(size);
   if (raw_block == NULL) {
     return NULL;
   }
@@ -1156,13 +1100,15 @@ allocate_new_block(const BlockSize size) {
 
 static inline const AllocatedBlock
 allocate_free_block(const FreeBlock free_block) {
+  remove_current(free_block);
   const Block block = from_free(free_block);
   set_allocated(block);
   return into_allocated(block);
 }
 
-static inline const __Nullable Payload allocate_to_extended_last_block(
-  const FreeBlock free_block, const BlockSize size) {
+static inline const Payload
+allocate_to_extended_last_block(const FreeBlock free_block,
+                                const BlockSize size) {
   const Block block = from_free(free_block);
   debug_assert(is_last_block(block));
   // We call this function on first free block, so previous must be allocated.
@@ -1177,7 +1123,6 @@ static inline const __Nullable Payload allocate_to_extended_last_block(
     return NULL;
   }
 
-  remove_current(free_block);
   const AllocatedBlock allocated_block = allocate_free_block(free_block);
   set_allocated_block_size(allocated_block, size);
 
@@ -1197,13 +1142,12 @@ static inline const Payload allocate_with_split(const FreeBlock free_block,
 
   // Block is too small to split, its size stays the same.
   if (empty_block_size < MINIMUM_BLOCK_SIZE) {
-    __Nullable AnyBlock next = maybe_get_next_block(block);
+    AnyBlock next = maybe_get_next_block(block);
 
     if (next != NULL) {
       set_previous_allocated(from_any(next));
     }
 
-    remove_current(free_block);
     const AllocatedBlock allocated_block = allocate_free_block(free_block);
     return get_payload(allocated_block);
   }
@@ -1222,9 +1166,6 @@ static inline const Payload allocate_with_split(const FreeBlock free_block,
     set_last_block(empty_block);
   }
 
-  remove_current(free_block);
-  push_front(empty_free_block);
-  // replace_current(free_block, empty_free_block);
   const AllocatedBlock allocated_block = allocate_free_block(free_block);
   set_allocated_block_size(allocated_block, size);
 
@@ -1326,7 +1267,7 @@ deallocate_allocated_block(AllocatedBlock allocated_block) {
   const Block block = from_allocated(allocated_block);
   set_free(block);
   const FreeBlock free_block = into_free(block);
-  // push_front(free_block);
+  push_front(free_block);
   return free_block;
 }
 
@@ -1353,7 +1294,6 @@ static inline void deallocate(const Payload payload) {
   if (!is_previous_free(block)) {
     const FreeBlock free_block = deallocate_allocated_block(allocated_block);
     set_free_block_size(free_block, block_size);
-    push_front(free_block);
     return;
   }
 
@@ -1414,7 +1354,6 @@ reallocate_shrink_with_split(const AllocatedBlock allocated_block,
     const Block empty_block = from_free(empty_free_block);
     set_previous_allocated(empty_block);
     set_last_block(empty_block);
-    push_front(empty_free_block);
     return;
   }
 
@@ -1425,7 +1364,6 @@ reallocate_shrink_with_split(const AllocatedBlock allocated_block,
     const Block empty_block = from_free(empty_free_block);
     set_previous_allocated(empty_block);
     set_previous_free(next);
-    push_front(empty_free_block);
     return;
   }
 
@@ -1438,7 +1376,6 @@ reallocate_shrink_with_split(const AllocatedBlock allocated_block,
   if (is_last_block(next)) {
     set_last_block(empty_block);
   }
-  push_front(empty_free_block);
 }
 
 static inline void reallocate_extend_with_split(
@@ -1456,6 +1393,8 @@ static inline void reallocate_extend_with_split(
   const Block block = from_allocated(allocated_block);
   const Block next = from_free(free_next);
 
+  remove_current(free_next);
+
   // Block is too small to split, so its size stays the same.
   if (empty_block_size < MINIMUM_BLOCK_SIZE) {
     set_allocated_block_size(allocated_block, new_size);
@@ -1463,13 +1402,11 @@ static inline void reallocate_extend_with_split(
     const NullableBlock nullable_next_next = maybe_get_next_block(next);
     if (nullable_next_next == NULL) {
       set_last_block(block);
-      remove_current(free_next);
       return;
     }
 
     const Block next_next = from_nullable(nullable_next_next);
     set_previous_allocated(next_next);
-    remove_current(free_next);
     return;
   }
 
@@ -1482,8 +1419,6 @@ static inline void reallocate_extend_with_split(
   if (is_last_block(next)) {
     set_last_block(empty_block);
   }
-  remove_current(free_next);
-  push_front(empty_free_block);
 
   set_allocated_block_size(allocated_block, new_size);
 }
