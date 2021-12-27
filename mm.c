@@ -11,6 +11,7 @@
  * This code is correct and blazingly fast, but very bad usage-wise since
  * it never frees anything.
  */
+
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,7 +26,7 @@
 
 /* If you want debugging output, use the following macro.  When you hand
  * in, remove the #define DEBUG line. */
-#define DEBUG
+// #define DEBUG
 #ifdef DEBUG
 #define debug(statement) statement
 #define debug_msg(...) printf(__VA_ARGS__)
@@ -60,22 +61,44 @@
 
 #define MINIMUM_BLOCK_SIZE ALIGNMENT
 
-typedef void *Payload;
+typedef void *MemoryLocation;
 typedef uint32_t Word;
+
 typedef Word BoundaryTag;
 typedef BoundaryTag Header;
 typedef BoundaryTag Footer;
+
+typedef MemoryLocation Payload;
+
 typedef Word UnalignedPayloadSize;
 typedef Word PayloadSize;
+
 typedef Word BlockSize;
 typedef Word UnalignedBlockSize;
+
 typedef Word BlockState;
+
+typedef Word BlockNodePointer;
 
 #define HEADER_SIZE sizeof(Header)
 #define FOOTER_SIZE sizeof(Footer)
 
-struct block {
+typedef MemoryLocation NullableBlock;
+typedef MemoryLocation RawBlock;
+typedef struct {
   Header header;
+  /**
+   * We don't know what the size of the payload will be, so we will
+   * declare it as a zero-length array.  This allow us to obtain a
+   * pointer to the start of the payload.
+   */
+  uint8_t payload[];
+} * AnyBlock;
+
+typedef struct {
+  Header header;
+  BlockNodePointer previous;
+  BlockNodePointer next;
   /**
    * We don't know what the size of the payload will be, so we will
    * declare it as a zero-length array.  This allow us to obtain a
@@ -84,16 +107,17 @@ struct block {
   uint8_t payload[];
   // As we don't know payload size here, we need to manually get the footer.
   // Footer footer;
-};
+} * FreeBlock;
 
-typedef struct block *Block;
+typedef AnyBlock AllocatedBlock;
 
-/**
- * Block without its structure.
- */
-typedef Block UninitBlock;
-typedef Block FreeBlock;
-typedef Block AllocatedBlock;
+typedef union {
+  NullableBlock nullable;
+  RawBlock raw;
+  AnyBlock any;
+  FreeBlock free;
+  AllocatedBlock allocated;
+} Block;
 
 #ifdef DEBUG
 typedef enum {
@@ -117,6 +141,10 @@ debug(static uint32_t verbosity = 0;)
 #define ALLOCATED_PROPERTY 0
 #define NEXT_ALLOCATED_PROPERTY 1
 #define PREVIOUS_ALLOCATED_PROPERTY 2
+
+#define shift_right(pointer, offset) (void *)(pointer) + (offset)
+
+#define shift_left(pointer, offset) (void *)(pointer) - (offset)
 
 static inline const bool is_property_mask(const Word property_mask) {
   return !(property_mask & (property_mask - 1)) &&
@@ -169,13 +197,14 @@ static inline const BlockSize extract_block_size(const BoundaryTag tag) {
   return tag & BLOCK_SIZE_MASK;
 }
 
-inline static bool is_uninit_block(__Nullable UninitBlock block) {
-  return block != NULL && is_aligned((size_t)block + HEADER_SIZE);
+inline static const bool is_raw_block(const Block block) {
+  return block.nullable != NULL &&
+         is_aligned((size_t)shift_right(block.raw, HEADER_SIZE));
 }
 
-inline static bool is_block(__Nullable Block block) {
-  return is_uninit_block(block) &&
-         extract_block_size(block->header) >= MINIMUM_BLOCK_SIZE;
+inline static const bool is_any_block(const Block block) {
+  return is_raw_block(block) &&
+         extract_block_size(block.any->header) >= MINIMUM_BLOCK_SIZE;
 }
 
 static inline const bool is_block_state(const BlockState state) {
@@ -186,19 +215,19 @@ static inline const BlockState extract_header_state(const Header header) {
   return header & ~BLOCK_SIZE_MASK;
 }
 
-static inline const BlockState get_state(UninitBlock block) {
-  debug_assert(is_uninit_block(block));
+static inline const BlockState get_state(const Block block) {
+  debug_assert(is_raw_block(block));
 
-  const Header header = block->header;
+  const Header header = block.any->header;
   const BlockState state = extract_header_state(header);
 
   debug_assert(is_block_state(state));
   return state;
 }
 
-static inline const bool get_property(UninitBlock block,
+static inline const bool get_property(const Block block,
                                       const Word property_index) {
-  debug_assert(is_uninit_block(block));
+  debug_assert(is_raw_block(block));
   debug_assert(property_index <= PROPERTIES_SIZE);
 
   const Word property_mask = shift_one_left(property_index);
@@ -207,60 +236,92 @@ static inline const bool get_property(UninitBlock block,
   return (get_state(block) & property_mask) >> property_index;
 }
 
-static inline const bool is_allocated(Block block) {
-  debug_assert(is_block(block));
-
+static inline const bool is_allocated(const Block block) {
   return get_property(block, ALLOCATED_PROPERTY);
 }
 
-static inline bool is_free(Block block) {
-  debug_assert(is_block(block));
-
+static inline const bool is_free(const Block block) {
   return !is_allocated(block);
 }
 
-static inline bool is_next_allocated(Block block) {
-  debug_assert(is_block(block));
-
+static inline const bool is_next_allocated(const Block block) {
   return get_property(block, NEXT_ALLOCATED_PROPERTY);
 }
 
-static inline bool is_next_free(Block block) {
-  debug_assert(is_block(block));
-
+static inline const bool is_next_free(const Block block) {
   return !is_next_allocated(block);
 }
 
-static inline bool is_previous_allocated(Block block) {
-  debug_assert(is_block(block));
-
+static inline const bool is_previous_allocated(const Block block) {
   return get_property(block, PREVIOUS_ALLOCATED_PROPERTY);
 }
 
-static inline bool is_previous_free(Block block) {
-  debug_assert(is_block(block));
-
+static inline const bool is_previous_free(const Block block) {
   return !is_previous_allocated(block);
 }
 
-inline static bool is_free_block(__Nullable FreeBlock block) {
-  return is_block(block) && is_free(block);
+static inline const bool is_free_block(const __Nullable Block block) {
+  return is_any_block(block) && is_free(block);
 }
 
-inline static bool is_allocated_block(__Nullable AllocatedBlock block) {
-  return is_block(block) && is_allocated(block);
+static inline const bool is_allocated_block(const __Nullable Block block) {
+  return is_any_block(block) && is_allocated(block);
 }
 
 static inline const Word round_to_alignment(const Word size) {
   return (size + ALIGNMENT - 1) & BLOCK_SIZE_MASK;
 }
 
-#define shift_right(pointer, offset) (void *)(pointer) + (offset)
+#define DECLARE_FROM_FUNCTION(name, type)                                      \
+  static inline Block from_##name(type name##_block) {                         \
+    const Block block = {.name = name##_block};                                \
+    debug_assert(is_##name##_block(block));                                    \
+    return block;                                                              \
+  }
 
-#define shift_left(pointer, offset) (void *)(pointer) - (offset)
+DECLARE_FROM_FUNCTION(raw, RawBlock)
+DECLARE_FROM_FUNCTION(any, AnyBlock)
+DECLARE_FROM_FUNCTION(free, FreeBlock)
+DECLARE_FROM_FUNCTION(allocated, AllocatedBlock)
 
-static inline bool compare_payloads(const Payload first, const Payload second,
-                                    const BlockSize size) {
+static inline const Block from_nullable(const NullableBlock nullable_block) {
+  debug_assert(nullable_block != NULL);
+  const Block block = {.nullable = nullable_block};
+  return block;
+}
+
+#define DECLARE_INTO_FUNCTION(name, type)                                      \
+  static inline type into_##name(const Block block) {                          \
+    debug_assert(is_##name##_block(block));                                    \
+    return block.name;                                                         \
+  }
+
+DECLARE_INTO_FUNCTION(raw, RawBlock)
+DECLARE_INTO_FUNCTION(any, AnyBlock)
+DECLARE_INTO_FUNCTION(free, FreeBlock)
+DECLARE_INTO_FUNCTION(allocated, AllocatedBlock)
+
+static inline const NullableBlock into_nullable(const Block block) {
+  return block.nullable;
+}
+
+static inline const RawBlock shift_right_block(const Block block,
+                                               const size_t amount) {
+  const RawBlock result = shift_right(into_raw(block), amount);
+  debug_assert(is_raw_block(from_raw(result)));
+  return result;
+}
+
+static inline const RawBlock shift_left_block(const Block block,
+                                              const size_t amount) {
+  const RawBlock result = shift_left(into_raw(block), amount);
+  debug_assert(is_raw_block(from_raw(result)));
+  return result;
+}
+
+static inline const bool compare_payloads(const Payload first,
+                                          const Payload second,
+                                          const BlockSize size) {
   debug_assert(first != NULL);
   debug_assert(second != NULL);
   debug_assert(is_block_size(size));
@@ -275,29 +336,35 @@ static inline bool compare_payloads(const Payload first, const Payload second,
   return true;
 }
 
-static inline Payload *get_payload(UninitBlock block) {
-  debug_assert(is_uninit_block(block));
-
-  Payload payload = block->payload;
+static inline const Payload get_payload(const AllocatedBlock allocated_block) {
+  const Payload payload = allocated_block->payload;
 
   debug_assert(payload != NULL);
-  debug_assert(shift_right(block, HEADER_SIZE) == payload);
+  debug_assert(shift_right(allocated_block, HEADER_SIZE) == payload);
   return payload;
 }
 
-static inline const BlockSize get_block_size(Block block) {
-  debug_assert(is_block(block));
-
-  const Header header = block->header;
+static inline const BlockSize get_block_size(const Block block) {
+  const AnyBlock any_block = into_any(block);
+  const Header header = any_block->header;
   const BlockSize block_size = extract_block_size(header);
 
   debug_assert(is_block_size(block_size));
   return block_size;
 }
 
-static inline const PayloadSize get_payload_size(Block block) {
-  debug_assert(is_block(block));
+static inline const BlockSize get_free_block_size(const FreeBlock free_block) {
+  const Block block = from_free(free_block);
+  return get_block_size(block);
+}
 
+static inline const BlockSize
+get_allocated_block_size(const AllocatedBlock allocated_block) {
+  const Block block = from_allocated(allocated_block);
+  return get_block_size(block);
+}
+
+static inline const PayloadSize get_payload_size(const Block block) {
   const BlockSize block_size = get_block_size(block);
   const PayloadSize payload_size = block_to_payload_size(block_size);
 
@@ -305,29 +372,45 @@ static inline const PayloadSize get_payload_size(Block block) {
   return payload_size;
 }
 
-static inline Footer *get_footer_from_block_size(FreeBlock block,
+static inline Footer *get_footer_from_block_size(const FreeBlock free_block,
                                                  const BlockSize size) {
-  debug_assert(is_free_block(block));
   debug_assert(is_block_size(size));
 
-  Footer *footer = shift_right(block, size - FOOTER_SIZE);
+  Footer *footer = shift_right(free_block, size - FOOTER_SIZE);
 
   debug_assert(footer != NULL);
   return footer;
 }
 
-static inline Footer *get_footer(FreeBlock block) {
-  const BlockSize block_size = get_block_size(block);
-  return get_footer_from_block_size(block, block_size);
+static inline Footer *get_footer(const FreeBlock free_block) {
+  const BlockSize block_size = get_free_block_size(free_block);
+  return get_footer_from_block_size(free_block, block_size);
+}
+
+static inline bool is_first_block(const Block block) {
+  return into_raw(block) == into_raw(first_block);
+}
+
+static inline bool is_last_block(const Block block) {
+  const RawBlock raw = into_raw(block);
+  return raw == into_raw(last_block);
+}
+
+static inline void set_first_block(const Block block) {
+  first_block = block;
+}
+
+static inline void set_last_block(const Block block) {
+  last_block = block;
 }
 
 #ifdef DEBUG
 #define GET_BLOCK_SNAPSHOT(name, block)                                        \
   __Unused const BlockSize name##_header_block_size =                          \
-    extract_block_size(block->header);                                         \
+    extract_block_size(block.any->header);                                     \
   __Unused const BlockState name##_block_state =                               \
-    extract_header_state(block->header);                                       \
-  __Unused const Payload name##_payload = get_payload(block);
+    extract_header_state(block.any->header);                                   \
+  __Unused const Payload name##_payload = get_payload(block.allocated);
 #else
 #define GET_BLOCK_SNAPSHOT(name, block)
 #endif
@@ -339,14 +422,14 @@ static inline const BoundaryTag with_block_size(const BoundaryTag tag,
   return (tag & ~BLOCK_SIZE_MASK) | size;
 }
 
-static inline void set_header_block_size(UninitBlock block,
+static inline void set_header_block_size(const RawBlock raw_block,
                                          const BlockSize size) {
-  debug_assert(is_uninit_block(block));
+  const Block block = from_raw(raw_block);
   debug_assert(is_block_size(size));
 
   GET_BLOCK_SNAPSHOT(old, block);
 
-  Header *header = &block->header;
+  Header *header = &block.any->header;
   *header = with_block_size(*header, size);
 
   GET_BLOCK_SNAPSHOT(new, block);
@@ -356,19 +439,19 @@ static inline void set_header_block_size(UninitBlock block,
     compare_payloads(old_payload, new_payload, old_header_block_size));
 }
 
-static inline void set_footer_block_size(UninitBlock block,
+static inline void set_footer_block_size(const FreeBlock free_block,
                                          const BlockSize size) {
-  debug_assert(is_uninit_block(block));
   debug_assert(is_block_size(size));
 
+  debug(Block block = from_free(free_block););
   GET_BLOCK_SNAPSHOT(old, block);
 
-  Footer *footer = get_footer_from_block_size(block, size);
+  Footer *footer = get_footer_from_block_size(free_block, size);
   *footer = with_block_size(*footer, size);
 
   GET_BLOCK_SNAPSHOT(new, block);
   debug(const BlockSize new_footer_block_size =
-          extract_block_size(*get_footer(block)));
+          extract_block_size(*get_footer(free_block)));
   debug_assert(new_footer_block_size == size);
   debug_assert(old_header_block_size == new_header_block_size);
   debug_assert(old_block_state == new_block_state);
@@ -376,35 +459,29 @@ static inline void set_footer_block_size(UninitBlock block,
     compare_payloads(old_payload, new_payload, old_header_block_size));
 }
 
-static inline void set_allocated_uninit_block_size(UninitBlock block,
-                                                   const BlockSize size) {
-  debug_assert(is_uninit_block(block));
-
-  set_header_block_size(block, size);
+static inline void set_allocated_raw_block_size(const RawBlock raw_block,
+                                                const BlockSize size) {
+  set_header_block_size(raw_block, size);
 }
 
-static inline void set_allocated_block_size(AllocatedBlock block,
+static inline void set_allocated_block_size(const AllocatedBlock block,
                                             const BlockSize size) {
-  debug_assert(is_allocated_block(block));
-
-  set_allocated_uninit_block_size(block, size);
+  set_allocated_raw_block_size(block, size);
 }
 
-static inline void set_free_uninit_block_size(UninitBlock block,
-                                              const BlockSize size) {
-  debug_assert(is_uninit_block(block));
+static inline void set_free_raw_block_size(const RawBlock raw_block,
+                                           const BlockSize size) {
+  set_header_block_size(raw_block, size);
+  const FreeBlock free_block = into_free(from_raw(raw_block));
+  set_footer_block_size(free_block, size);
 
-  set_header_block_size(block, size);
-  set_footer_block_size(block, size);
-
-  debug_assert(extract_block_size(block->header) ==
-               extract_block_size(*get_footer(block)));
+  debug_assert(extract_block_size(free_block->header) ==
+               extract_block_size(*get_footer(free_block)));
 }
 
-static inline void set_free_block_size(FreeBlock block, const BlockSize size) {
-  debug_assert(is_free_block(block));
-
-  set_free_uninit_block_size(block, size);
+static inline void set_free_block_size(const FreeBlock block,
+                                       const BlockSize size) {
+  set_free_raw_block_size(block, size);
 }
 
 static inline const Header with_block_state(const Header header,
@@ -414,13 +491,13 @@ static inline const Header with_block_state(const Header header,
   return (header & BLOCK_SIZE_MASK) | state;
 }
 
-static inline void set_state(UninitBlock block, const BlockState state) {
-  debug_assert(is_uninit_block(block));
+static inline void set_state(const Block block, const BlockState state) {
+  debug_assert(is_raw_block(block));
   debug_assert(is_block_state(state));
 
   GET_BLOCK_SNAPSHOT(old, block);
 
-  Header *header = &block->header;
+  Header *header = &block.any->header;
   *header = with_block_state(*header, state);
 
   GET_BLOCK_SNAPSHOT(new, block);
@@ -430,9 +507,9 @@ static inline void set_state(UninitBlock block, const BlockState state) {
     compare_payloads(old_payload, new_payload, old_header_block_size));
 }
 
-static inline void set_property(UninitBlock block, const Word property_index,
+static inline void set_property(const Block block, const Word property_index,
                                 const bool value) {
-  debug_assert(is_uninit_block(block));
+  debug_assert(is_raw_block(block));
   debug_assert(property_index <= PROPERTIES_SIZE);
   debug_assert(is_bool(value));
 
@@ -447,73 +524,72 @@ static inline void set_property(UninitBlock block, const Word property_index,
   debug_assert(get_property(block, property_index) == value);
 }
 
-static inline void set_allocated_property(UninitBlock block, const bool value) {
+static inline void set_allocated_property(const Block block, const bool value) {
   set_property(block, ALLOCATED_PROPERTY, value);
 }
 
-static inline void set_free(UninitBlock block) {
+static inline void set_free(const Block block) {
   set_allocated_property(block, false);
 }
 
-static inline void set_allocated(UninitBlock block) {
+static inline void set_allocated(const Block block) {
   set_allocated_property(block, true);
 }
 
-static inline AllocatedBlock initialize_allocated_block(UninitBlock block,
-                                                        const BlockSize size) {
-  debug_assert(is_uninit_block(block));
+static inline const AllocatedBlock
+initialize_allocated_block(const RawBlock raw_block, const BlockSize size) {
+  const Block block = from_raw(raw_block);
 
   set_allocated(block);
-  set_allocated_uninit_block_size(block, size);
+  set_allocated_raw_block_size(raw_block, size);
 
-  debug_assert(is_allocated_block(block));
-  return block;
+  return into_allocated(block);
 }
 
-static inline FreeBlock initialize_free_block(UninitBlock block,
-                                              const BlockSize size) {
-  debug_assert(is_uninit_block(block));
+static inline const FreeBlock initialize_free_block(const RawBlock raw_block,
+                                                    const BlockSize size) {
+  const Block block = from_raw(raw_block);
 
   set_free(block);
-  set_free_uninit_block_size(block, size);
+  set_free_raw_block_size(raw_block, size);
 
-  debug_assert(is_free_block(block));
-  return block;
+  return into_free(block);
 }
 
-static inline void set_next_allocated_property(Block block, const bool value) {
-  debug_assert(is_block(block));
+static inline void set_next_allocated_property(const Block block,
+                                               const bool value) {
+  debug_assert(is_any_block(block));
 
   set_property(block, NEXT_ALLOCATED_PROPERTY, value);
 }
 
-static inline void set_next_free(Block block) {
-  debug_assert(is_block(block));
+static inline void set_next_free(const Block block) {
+  debug_assert(is_any_block(block));
 
   set_next_allocated_property(block, false);
 }
 
-static inline void set_next_allocated(Block block) {
-  debug_assert(is_block(block));
+static inline void set_next_allocated(const Block block) {
+  debug_assert(is_any_block(block));
 
   set_next_allocated_property(block, true);
 }
 
-static inline void set_previous_allocated_property(Block block,
+static inline void set_previous_allocated_property(const Block block,
                                                    const bool value) {
-  debug_assert(is_block(block));
+  debug_assert(is_any_block(block));
 
   set_property(block, PREVIOUS_ALLOCATED_PROPERTY, value);
 }
 
-static inline void set_previous_free(Block block) {
-  debug_assert(is_block(block));
+static inline void set_previous_free(const Block block) {
+  debug_assert(is_any_block(block));
 
   set_previous_allocated_property(block, false);
 }
 
-static inline void set_previous_allocated(Block block) {
-  debug_assert(is_block(block));
+static inline void set_previous_allocated(const Block block) {
+  debug_assert(is_any_block(block));
 
   set_previous_allocated_property(block, true);
 }
@@ -521,37 +597,35 @@ static inline void set_previous_allocated(Block block) {
 /**
  * Returns next block. Given block must not be the last one.
  */
-static inline Block get_next_block(Block block) {
-  debug_assert(is_block(block));
-  debug_assert(block != last_block);
+static inline const Block get_next_block(const Block block) {
+  debug_assert(!is_last_block(block));
   debug_assert(blocks_size > 0);
 
   const BlockSize block_size = get_block_size(block);
-  Block next_block = shift_right(block, block_size);
+  const RawBlock next_block = shift_right_block(block, block_size);
+  const Block result = from_raw(next_block);
 
-  debug_assert(is_block(next_block));
-  return next_block;
+  debug_assert(is_any_block(result));
+  return result;
 }
 
 /**
  * Returns next block or NULL if the given block was the last one.
  */
-static inline __Nullable Block maybe_get_next_block(Block block) {
-  debug_assert(is_block(block));
-
-  if (block == last_block) {
+static inline const NullableBlock maybe_get_next_block(const Block block) {
+  if (is_last_block(block)) {
     return NULL;
   }
-  debug_assert(block < last_block);
+  debug_assert(into_raw(block) < into_raw(last_block));
 
-  return get_next_block(block);
+  return into_nullable(get_next_block(block));
 }
 
 #define iterate_blocks(block, handler)                                         \
   {                                                                            \
     Block block = first_block;                                                 \
-    for (; block != last_block; block = get_next_block(block)) {               \
-      debug_assert(block < last_block);                                        \
+    for (; !is_last_block(block); block = get_next_block(block)) {             \
+      debug_assert(into_raw(block) < into_raw(last_block));                    \
       handler;                                                                 \
     }                                                                          \
     handler;                                                                   \
@@ -567,7 +641,7 @@ static inline __Nullable Block maybe_get_next_block(Block block) {
 static inline void print_block(Block block, const uint32_t index,
                                const int verbosity) {
   debug_assert(blocks_size > 0);
-  debug_assert(is_block(block));
+  debug_assert(is_any_block(block));
 
   const BlockSize header_block_size = get_block_size(block);
   if (verbosity < 3) {
@@ -586,10 +660,11 @@ static inline void print_block(Block block, const uint32_t index,
   }
 
   const PayloadSize header_payload_size = get_payload_size(block);
-  Payload *payload = get_payload(block);
+  // We want to print payload despite the block type.
+  Payload *payload = get_payload(block.allocated);
   printf("[%p] | (%x) Block size: %u; Payload size: %u; Allocated: %u; "
          "Previous allocated: %u |\n",
-         block, block->header, header_block_size, header_payload_size,
+         block.raw, block.any->header, header_block_size, header_payload_size,
          is_allocated(block), is_previous_allocated(block));
   printf("      [%p] | ", payload);
 
@@ -612,7 +687,7 @@ static inline void print_block(Block block, const uint32_t index,
   printf("|\n");
 
   if (is_free(block)) {
-    BoundaryTag *footer = get_footer(block);
+    BoundaryTag *footer = get_footer(into_free(block));
     const BlockSize footer_block_size = extract_block_size(*footer);
     const PayloadSize footer_payload_size =
       block_to_payload_size(footer_block_size);
@@ -625,11 +700,12 @@ static inline void check_invariants() {
   debug_assert(mem_heapsize() == blocks_size + ALIGNMENT - HEADER_SIZE);
 
   if (blocks_size > 0) {
-    debug_assert((void *)last_block < mem_heap_hi());
+    debug_assert((void *)last_block.raw < mem_heap_hi());
 
     iterate_blocks(
-      block, __Nullable Block next = maybe_get_next_block(block);
-      if (next != NULL) {
+      block, NullableBlock next_nullable = maybe_get_next_block(block);
+      if (next_nullable != NULL) {
+        Block next = from_nullable(next_nullable);
         if (is_allocated(block) != is_previous_allocated(next)) {
           print_block(block, 0, 4);
           print_block(next, 0, 4);
@@ -638,8 +714,11 @@ static inline void check_invariants() {
       });
 
     iterate_blocks(
-      block, __Nullable Block next = maybe_get_next_block(block);
-      if (is_free(block) && next != NULL) { debug_assert(!is_free(next)); })
+      block, NullableBlock next_nullable = maybe_get_next_block(block);
+      if (is_free(block) && next_nullable != NULL) {
+        Block next = from_nullable(next_nullable);
+        debug_assert(!is_free(next));
+      })
   }
 }
 
@@ -708,23 +787,23 @@ static inline void check_heap(OperationType operation, void *input_payload,
 }
 #endif
 
-typedef Payload SbrkResult;
-
-static inline bool is_sbrk_failed(SbrkResult result) {
-  return result < 0;
-}
-
-static inline __Nullable SbrkResult allocate_heap_space(const BlockSize size) {
+/**
+ * Allocates new uninitialized block. Returns NULL if allocation
+ * fails.
+ */
+static inline const __Nullable RawBlock new_raw_block(const BlockSize size) {
   debug_assert(is_block_size(size));
 
-  const SbrkResult result = mem_sbrk(size);
-  if (is_sbrk_failed(result)) {
+  const MemoryLocation result = mem_sbrk(size);
+  if (result < 0) {
     return NULL;
   }
 
+  const RawBlock block = (RawBlock)result;
   blocks_size += size;
 
-  return result;
+  debug_assert(is_raw_block(from_raw(block)));
+  return block;
 }
 
 /*
@@ -732,71 +811,68 @@ static inline __Nullable SbrkResult allocate_heap_space(const BlockSize size) {
  */
 int mm_init(void) {
   /* Pad heap start so first payload is at ALIGNMENT. */
-  const SbrkResult allocate_alignment_result =
+  const MemoryLocation allocate_alignment_result =
     mem_sbrk(ALIGNMENT - HEADER_SIZE);
-  if (is_sbrk_failed(allocate_alignment_result)) {
+  if (allocate_alignment_result < 0) {
     return -1;
   }
 
-  first_block = mem_sbrk(0);
-  last_block = first_block;
+  set_first_block(from_raw(mem_sbrk(0)));
+  set_last_block(first_block);
   blocks_size = 0;
-
-  debug_assert(is_uninit_block(first_block));
 
   return 0;
 }
 
-static inline bool heap_has_no_allocated_blocks() {
-  return blocks_size == 0;
-}
-
-/*
- * Find first free and sufficient block or return NULL.
+/**
+ * Finds first free and sufficient block or returns NULL.
  */
-static inline __Nullable FreeBlock find_first_free_block(const BlockSize size) {
+static inline const NullableBlock find_first_free_block(const BlockSize size) {
   debug_assert(is_block_size(size));
-  debug_assert(is_block(first_block));
-  debug_assert(is_block(last_block));
+  debug_assert(is_any_block(first_block));
+  debug_assert(is_any_block(last_block));
   debug_assert(blocks_size > 0);
 
   iterate_blocks(
-    block, debug_assert(is_block(block));
-    if (is_free(block) && get_block_size(block) >= size) {
-      debug_assert(is_free_block(block));
-      return block;
+    block, if (is_free(block) && get_block_size(block) >= size) {
+      return into_nullable(block);
     });
 
   return NULL;
 }
 
-#undef handle_block
-
-static inline __Nullable Payload allocate_new_block(const BlockSize size) {
+static inline const __Nullable Payload
+allocate_new_block(const BlockSize size) {
   debug_assert(is_block_size(size));
 
-  __Nullable SbrkResult allocated_space = allocate_heap_space(size);
-  if (allocated_space == NULL) {
+  const __Nullable RawBlock raw_block = new_raw_block(size);
+  if (raw_block == NULL) {
     return NULL;
   }
 
-  UninitBlock uninit_block = (UninitBlock)allocated_space;
-
-  AllocatedBlock block = initialize_allocated_block(uninit_block, size);
+  const AllocatedBlock allocated_block =
+    initialize_allocated_block(raw_block, size);
   // We call this function if all blocks were allocated, so previous must be
   // allocated.
-  set_previous_allocated(uninit_block);
+  const Block block = from_allocated(allocated_block);
+  set_previous_allocated(block);
 
-  last_block = block;
+  set_last_block(block);
 
-  return get_payload(block);
+  return get_payload(allocated_block);
 }
 
-static inline __Nullable Payload
-allocate_to_extended_last_block(FreeBlock block, const BlockSize size) {
-  debug_assert(is_free_block(block));
-  debug_assert(block == last_block);
-  debug_assert(shift_right(block, get_block_size(block) - 1) == mem_heap_hi());
+static inline const AllocatedBlock
+allocate_free_block(const FreeBlock free_block) {
+  const Block block = from_free(free_block);
+  set_allocated(block);
+  return into_allocated(block);
+}
+
+static inline const __Nullable Payload allocate_to_extended_last_block(
+  const FreeBlock free_block, const BlockSize size) {
+  const Block block = from_free(free_block);
+  debug_assert(is_last_block(block));
   // We call this function on first free block, so previous must be allocated.
   debug_assert(is_previous_allocated(block));
   debug_assert(is_block_size(size));
@@ -804,24 +880,20 @@ allocate_to_extended_last_block(FreeBlock block, const BlockSize size) {
   const BlockSize old_size = get_block_size(block);
   const BlockSize additional_space = size - old_size;
 
-  const SbrkResult result = allocate_heap_space(additional_space);
+  const RawBlock result = new_raw_block(additional_space);
   if (result == NULL) {
     return NULL;
   }
 
-  set_allocated(block);
-
-  AllocatedBlock allocated_block = block;
-  debug_assert(is_allocated_block(allocated_block));
-
+  const AllocatedBlock allocated_block = allocate_free_block(free_block);
   set_allocated_block_size(allocated_block, size);
 
   return get_payload(allocated_block);
 }
 
-static inline Payload allocate_with_split(FreeBlock block,
-                                          const BlockSize size) {
-  debug_assert(is_free_block(block));
+static inline const Payload allocate_with_split(const FreeBlock free_block,
+                                                const BlockSize size) {
+  const Block block = from_free(free_block);
   // We call this function on first free block, so previous must be allocated.
   debug_assert(is_previous_allocated(block));
   debug_assert(is_block_size(size));
@@ -830,19 +902,16 @@ static inline Payload allocate_with_split(FreeBlock block,
   const BlockSize empty_block_size = old_block_size - size;
   debug_assert(is_block_size(empty_block_size));
 
-  set_allocated(block);
-
-  AllocatedBlock allocated_block = block;
-  debug_assert(is_allocated_block(allocated_block));
+  const AllocatedBlock allocated_block = allocate_free_block(free_block);
 
   const Payload payload = get_payload(allocated_block);
 
   // Block is too small to split, its size stays the same.
   if (empty_block_size < MINIMUM_BLOCK_SIZE) {
-    __Nullable Block next = maybe_get_next_block(block);
+    __Nullable AnyBlock next = maybe_get_next_block(block);
 
     if (next != NULL) {
-      set_previous_allocated(next);
+      set_previous_allocated(from_any(next));
     }
 
     return payload;
@@ -850,24 +919,24 @@ static inline Payload allocate_with_split(FreeBlock block,
 
   set_allocated_block_size(allocated_block, size);
 
-  UninitBlock empty_uninit_block = shift_right(allocated_block, size);
-  debug_assert(is_uninit_block(empty_uninit_block));
+  const RawBlock empty_raw_block = shift_right_block(block, size);
 
-  FreeBlock empty_block =
-    initialize_free_block(empty_uninit_block, empty_block_size);
+  const FreeBlock empty_free_block =
+    initialize_free_block(empty_raw_block, empty_block_size);
+  const Block empty_block = from_free(empty_free_block);
   set_previous_allocated(empty_block);
 
-  debug_assert(shift_right(block, old_block_size - FOOTER_SIZE) ==
-               get_footer(empty_block));
+  debug_assert(shift_right(into_raw(block), old_block_size - FOOTER_SIZE) ==
+               get_footer(empty_free_block));
 
-  if (allocated_block == last_block) {
-    last_block = empty_block;
+  if (is_last_block(block)) {
+    set_last_block(empty_block);
   }
 
   return payload;
 }
 
-static inline Payload allocate(UnalignedPayloadSize size) {
+static inline const Payload allocate(const UnalignedPayloadSize size) {
   debug_assert(size < MAX_HEAP);
 
   const UnalignedBlockSize unaligned_block_size =
@@ -875,30 +944,29 @@ static inline Payload allocate(UnalignedPayloadSize size) {
   const BlockSize block_size = round_to_alignment(unaligned_block_size);
 
   // This is the first allocation.
-  if (heap_has_no_allocated_blocks()) {
+  if (blocks_size == 0) {
     // There are no previous blocks, so previous block is not free - it is
     // allocated.
     return allocate_new_block(block_size);
   }
 
-  __Nullable FreeBlock found_block = find_first_free_block(block_size);
+  const NullableBlock nullable_found_block = find_first_free_block(block_size);
 
   // Found empty block with sufficient space.
-  if (found_block != NULL) {
-    return allocate_with_split(found_block, block_size);
+  if (nullable_found_block != NULL) {
+    const Block found_block = from_nullable(nullable_found_block);
+    const FreeBlock found_free_block = into_free(found_block);
+    return allocate_with_split(found_free_block, block_size);
   }
 
   // Last block is free, but too small.
   if (is_free(last_block)) {
-    FreeBlock block = last_block;
-    debug_assert(is_free_block(block));
-
-    return allocate_to_extended_last_block(block, block_size);
+    const FreeBlock free_block = into_free(last_block);
+    return allocate_to_extended_last_block(free_block, block_size);
   }
 
   // Last block was allocated, so we need to allocate a new one.
-  __Nullable Payload payload = allocate_new_block(block_size);
-  return payload;
+  return allocate_new_block(block_size);
 }
 
 /**
@@ -914,17 +982,18 @@ void *malloc(size_t size) {
   return result;
 }
 
-static inline Footer *get_previous_footer(Block block) {
-  debug_assert(is_block(block));
+static inline const Footer *get_previous_footer(const Block block) {
+  debug_assert(is_any_block(block));
   debug_assert(is_previous_free(block));
-  debug_assert(block != first_block);
+  debug_assert(!is_first_block(block));
   debug_assert(blocks_size > 0);
 
-  BoundaryTag *previous_footer = shift_left(block, FOOTER_SIZE);
+  const BoundaryTag *previous_footer = shift_left(into_raw(block), FOOTER_SIZE);
 
   debug(const BlockSize previous_footer_block_size =
           extract_block_size(*previous_footer));
-  debug(Block previous_block = shift_left(block, previous_footer_block_size));
+  debug(Block previous_block =
+          from_raw(shift_left_block(block, previous_footer_block_size)));
   debug_assert(is_free_block(previous_block));
   debug_assert(previous_footer_block_size == get_block_size(previous_block));
 
@@ -934,56 +1003,68 @@ static inline Footer *get_previous_footer(Block block) {
 /**
  * Returns previous block. Given block must have free previous block property.
  */
-static inline FreeBlock get_previous_block(Block block) {
-  BoundaryTag *previous_footer = get_previous_footer(block);
+static inline const FreeBlock get_previous_block(const Block block) {
+  const BoundaryTag *previous_footer = get_previous_footer(block);
   const BlockSize previous_block_size = extract_block_size(*previous_footer);
   debug_assert(is_block_size(previous_block_size));
 
-  FreeBlock previous_block = shift_left(block, previous_block_size);
-
-  debug_assert(is_free_block(previous_block));
-  return previous_block;
+  const RawBlock raw_previous_block =
+    shift_left_block(block, previous_block_size);
+  const Block previous_block = from_raw(raw_previous_block);
+  return into_free(previous_block);
 }
 
-static inline AllocatedBlock get_block_from_payload(Payload payload) {
+static inline const AllocatedBlock
+get_block_from_payload(const Payload payload) {
   debug_assert(payload != NULL);
 
-  AllocatedBlock block = shift_left(payload, HEADER_SIZE);
-
-  debug_assert(is_allocated_block(block));
-  return block;
+  const RawBlock raw_block = shift_left(payload, HEADER_SIZE);
+  const Block block = from_raw(raw_block);
+  return into_allocated(block);
 }
 
-static inline void deallocate(Payload payload) {
-  AllocatedBlock block = get_block_from_payload(payload);
+static inline const FreeBlock
+deallocate_allocated_block(AllocatedBlock allocated_block) {
+  const Block block = from_allocated(allocated_block);
+  set_free(block);
+  return into_free(block);
+}
+
+static inline void deallocate(const Payload payload) {
+  const AllocatedBlock allocated_block = get_block_from_payload(payload);
+  const Block block = from_allocated(allocated_block);
   BlockSize block_size = get_block_size(block);
 
-  // TODO: use NEXT_ALLOCATED property (set it in malloc first)
-  __Nullable Block next_block = maybe_get_next_block(block);
-  if (next_block != NULL) {
+  const NullableBlock nullable_next_block = maybe_get_next_block(block);
+  if (nullable_next_block != NULL) {
+    const Block next_block = from_nullable(nullable_next_block);
     if (is_free(next_block)) {
       block_size += get_block_size(next_block);
 
-      if (next_block == last_block) {
-        last_block = block;
+      if (is_last_block(next_block)) {
+        set_last_block(block);
       }
     } else {
       set_previous_free(next_block);
     }
   }
 
-  if (is_previous_free(block)) {
-    FreeBlock previous_block = get_previous_block(block);
-    block_size += get_block_size(previous_block);
-
-    if (block == last_block) {
-      last_block = previous_block;
-    }
-    block = previous_block;
+  if (!is_previous_free(block)) {
+    const FreeBlock free_block = deallocate_allocated_block(allocated_block);
+    set_free_block_size(free_block, block_size);
+    return;
   }
 
-  set_free(block);
-  set_free_block_size(block, block_size);
+  const FreeBlock free_previous_block = get_previous_block(block);
+  const Block previous_block = from_free(free_previous_block);
+
+  block_size += get_block_size(previous_block);
+
+  if (is_last_block(block)) {
+    set_last_block(previous_block);
+  }
+
+  set_free_block_size(free_previous_block, block_size);
 }
 
 /**
@@ -1001,15 +1082,14 @@ void free(void *ptr) {
   debug(check_heap(FREE, ptr, 0, NULL););
 }
 
-static inline void reallocate_shrink_with_split(AllocatedBlock block,
-                                                const BlockSize old_size,
-                                                const BlockSize size) {
-  debug_assert(is_allocated_block(block));
+static inline void
+reallocate_shrink_with_split(const AllocatedBlock allocated_block,
+                             const BlockSize old_size, const BlockSize size) {
   debug_assert(is_block_size(old_size));
   debug_assert(is_block_size(size));
   debug_assert(old_size > size);
 
-  BlockSize empty_block_size = old_size - size;
+  const BlockSize empty_block_size = old_size - size;
   debug_assert(is_block_size(empty_block_size));
 
   // Block is too small to split, so its size stays the same.
@@ -1017,82 +1097,96 @@ static inline void reallocate_shrink_with_split(AllocatedBlock block,
     return;
   }
 
-  UninitBlock empty_uninit_block = shift_right(block, size);
+  const Block block = from_allocated(allocated_block);
+  const RawBlock empty_raw_block = shift_right_block(block, size);
 
-  __Nullable Block next = maybe_get_next_block(block);
+  const NullableBlock nullable_next = maybe_get_next_block(block);
 
-  if (next != NULL) {
-    if (is_free(next)) {
-      empty_block_size += get_block_size(next);
-      if (next == last_block) {
-        last_block = empty_uninit_block;
-      }
-    } else {
-      set_previous_free(next);
-    }
-  } else {
-    last_block = empty_uninit_block;
+  set_allocated_block_size(allocated_block, size);
+
+  if (nullable_next == NULL) {
+    const FreeBlock empty_free_block =
+      initialize_free_block(empty_raw_block, empty_block_size);
+    const Block empty_block = from_free(empty_free_block);
+    set_previous_allocated(empty_block);
+    set_last_block(empty_block);
+    return;
   }
 
-  set_allocated_block_size(block, size);
+  const Block next = from_nullable(nullable_next);
+  if (is_allocated(next)) {
+    const FreeBlock empty_free_block =
+      initialize_free_block(empty_raw_block, empty_block_size);
+    const Block empty_block = from_free(empty_free_block);
+    set_previous_allocated(empty_block);
+    set_previous_free(next);
+    return;
+  }
 
-  FreeBlock empty_block =
-    initialize_free_block(empty_uninit_block, empty_block_size);
+  const BlockSize next_block_size = get_block_size(next);
+  const FreeBlock empty_free_block =
+    initialize_free_block(empty_raw_block, empty_block_size + next_block_size);
+  const Block empty_block = from_free(empty_free_block);
   set_previous_allocated(empty_block);
+
+  if (is_last_block(next)) {
+    set_last_block(empty_block);
+  }
 }
 
-static inline void reallocate_extend_with_split(AllocatedBlock block,
-                                                FreeBlock next,
-                                                const BlockSize block_size,
-                                                const BlockSize next_size,
-                                                const BlockSize new_size) {
-  debug_assert(is_allocated_block(block));
-  debug_assert(is_free_block(next));
+static inline void reallocate_extend_with_split(
+  const AllocatedBlock allocated_block, const FreeBlock free_next,
+  const BlockSize block_size, const BlockSize next_size,
+  const BlockSize new_size) {
   debug_assert(is_block_size(block_size));
   debug_assert(is_block_size(next_size));
   debug_assert(is_block_size(new_size));
   debug_assert(block_size + next_size >= new_size);
 
-  BlockSize empty_block_size = block_size + next_size - new_size;
+  const BlockSize empty_block_size = block_size + next_size - new_size;
   debug_assert(is_block_size(empty_block_size));
+
+  const Block block = from_allocated(allocated_block);
+  const Block next = from_free(free_next);
 
   // Block is too small to split, so its size stays the same.
   if (empty_block_size < MINIMUM_BLOCK_SIZE) {
-    set_allocated_block_size(block, new_size);
+    set_allocated_block_size(allocated_block, new_size);
 
-    __Nullable Block next_next = maybe_get_next_block(next);
-    if (next_next == NULL) {
-      last_block = block;
+    const NullableBlock nullable_next_next = maybe_get_next_block(next);
+    if (nullable_next_next == NULL) {
+      set_last_block(block);
       return;
     }
 
+    const Block next_next = from_nullable(nullable_next_next);
     set_previous_allocated(next_next);
     return;
   }
 
-  UninitBlock empty_uninit_block = shift_right(block, new_size);
-  FreeBlock empty_block =
-    initialize_free_block(empty_uninit_block, empty_block_size);
+  const RawBlock empty_raw_block = shift_right_block(block, new_size);
+  const FreeBlock empty_free_block =
+    initialize_free_block(empty_raw_block, empty_block_size);
+  const Block empty_block = from_free(empty_free_block);
   set_previous_allocated(empty_block);
 
-  if (next == last_block) {
-    last_block = empty_uninit_block;
+  if (is_last_block(next)) {
+    set_last_block(empty_block);
   }
 
-  set_allocated_block_size(block, new_size);
+  set_allocated_block_size(allocated_block, new_size);
 }
 
-static inline const SbrkResult reallocate_with_extend(AllocatedBlock block,
-                                                      const BlockSize old_size,
-                                                      const BlockSize size) {
-  debug_assert(is_allocated_block(block));
+static inline const MemoryLocation
+reallocate_with_extend(const AllocatedBlock block, const BlockSize old_size,
+                       const BlockSize size) {
   debug_assert(is_block_size(old_size));
   debug_assert(is_block_size(size));
   debug_assert(size > old_size);
 
   const BlockSize additional_space = size - old_size;
 
-  const SbrkResult result = allocate_heap_space(additional_space);
+  const MemoryLocation result = new_raw_block(additional_space);
   if (result == NULL) {
     return NULL;
   }
@@ -1102,38 +1196,35 @@ static inline const SbrkResult reallocate_with_extend(AllocatedBlock block,
   return result;
 }
 
-static inline Payload reallocate(Payload old_payload,
-                                 UnalignedPayloadSize size) {
+static inline const Payload reallocate(const Payload old_payload,
+                                       const UnalignedPayloadSize size) {
   debug_assert(size < MAX_HEAP);
 
   const UnalignedBlockSize unaligned_block_size =
     unaligned_payload_to_block_size(size);
   const BlockSize block_size = round_to_alignment(unaligned_block_size);
 
-  AllocatedBlock block = get_block_from_payload(old_payload);
-  debug_assert(is_allocated_block(block));
-
-  BlockSize old_block_size = get_block_size(block);
+  const AllocatedBlock allocated_block = get_block_from_payload(old_payload);
+  const BlockSize old_block_size = get_allocated_block_size(allocated_block);
 
   if (block_size == old_block_size) {
     return old_payload;
   }
 
   if (block_size < old_block_size) {
-    reallocate_shrink_with_split(block, old_block_size, block_size);
+    reallocate_shrink_with_split(allocated_block, old_block_size, block_size);
     return old_payload;
   }
 
-  __Nullable Block next = maybe_get_next_block(block);
+  const Block block = from_allocated(allocated_block);
+  const NullableBlock nullable_next = maybe_get_next_block(block);
 
   // Reallocated block is the last one.
-  if (next == NULL) {
-    debug_assert(block == last_block);
-    debug_assert(shift_right(block, get_block_size(block) - 1) ==
-                 mem_heap_hi());
+  if (nullable_next == NULL) {
+    debug_assert(is_last_block(block));
 
-    const SbrkResult result =
-      reallocate_with_extend(block, old_block_size, block_size);
+    const MemoryLocation result =
+      reallocate_with_extend(allocated_block, old_block_size, block_size);
     if (result == NULL) {
       return NULL;
     }
@@ -1141,38 +1232,40 @@ static inline Payload reallocate(Payload old_payload,
     return old_payload;
   }
 
+  const Block next = from_nullable(nullable_next);
   if (is_free(next)) {
+    const FreeBlock free_next = into_free(next);
     const BlockSize next_size = get_block_size(next);
 
     if (old_block_size + next_size >= block_size) {
-      reallocate_extend_with_split(block, next, old_block_size, next_size,
-                                   block_size);
+      reallocate_extend_with_split(allocated_block, free_next, old_block_size,
+                                   next_size, block_size);
       return old_payload;
     }
 
     // Next free block is too small, so check if it is the last block.
-    if (next == last_block) {
-      const SbrkResult result =
-        reallocate_with_extend(block, old_block_size + next_size, block_size);
+    if (is_last_block(next)) {
+      const MemoryLocation result = reallocate_with_extend(
+        allocated_block, old_block_size + next_size, block_size);
       if (result == NULL) {
         return NULL;
       }
 
-      last_block = block;
+      set_last_block(block);
       return old_payload;
     }
   }
 
   // Next block is allocated, so we don't have enough space to allocate.
 
-  Payload payload = allocate(size);
+  const Payload payload = allocate(size);
 
   /* If malloc() fails, the original block is left untouched. */
   if (payload == NULL) {
     return NULL;
   }
 
-  PayloadSize payload_size = block_to_payload_size(old_block_size);
+  const PayloadSize payload_size = block_to_payload_size(old_block_size);
   /* Copy the old data. */
   memcpy(payload, old_payload, payload_size);
 
@@ -1211,7 +1304,7 @@ void *realloc(void *old_ptr, size_t size) {
  * calloc - Allocate the block and set it to zero.
  */
 void *calloc(size_t nmemb, size_t size) {
-  size_t bytes = nmemb * size;
+  const size_t bytes = nmemb * size;
   void *new_ptr = malloc(bytes);
 
   /* If malloc() fails, skip zeroing out the memory. */

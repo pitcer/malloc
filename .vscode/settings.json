@@ -20,7 +20,8 @@
         "string": "c",
         "vector": "c",
         "iterator": "c",
-        "valarray": "c"
+        "valarray": "c",
+        "typeinfo": "c"
     },
     "editor.rulers": [
         80
