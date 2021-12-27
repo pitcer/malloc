@@ -1,15 +1,39 @@
 /*
  * Piotr Dobiech 316625
+ * I am the only author of this source code.
  *
- * mm-naive.c - The fastest, least memory-efficient malloc package.
+ * Code could be a little overwhelming. As I understand rules correctly there is
+ * no option to split it into different files, so unfortunately reading it
+ * wouldn't be easy. That size is mostly caused by my approach to use contract
+ * based "type" checking. Sometimes functions are mostly made of asserts to test
+ * if variables has preserved their properties. Overall this project showed me
+ * how unsafe and hard to maintain is code in C.
  *
- * In this naive approach, a block is allocated by simply incrementing
- * the brk pointer.  Blocks are never coalesced or reused.  The size of
- * a block is found at the first aligned word before the block (we need
- * it for realloc).
+ * In this implementation I use free blocks list with FIFO insertion and
+ * first-fit search policy. In `free` I coalesce free blocks eagerly using
+ * optimized boundary tags. `realloc` has optimizations for probably most edge
+ * cases.
  *
- * This code is correct and blazing fast, but very bad usage-wise since
- * it never frees anything.
+ * Allocated blocks have the following structure:
+ * ,----------------------------,
+ * | Header (4 bytes) | Payload |
+ * '----------------------------'
+ *  where Header has the following structure:
+ * ,-------------------------------------------------------------------,
+ * | Block size (28 bits) | 0 | 0 | Prev-alloc (1 bit) | Alloc (1 bit) |
+ * '-------------------------------------------------------------------'
+ * where Prev-alloc is a bit, which is set when previous block is allocated,
+ * Alloc is a bit, which is set when this block is allocated.
+ *
+ * Free blocks have the following structure:
+ * ,------------------------------------------------------------------,
+ * | Header (4B) | Previous (4B) | Next (4B) | (unused) | Footer (4B) |
+ * '------------------------------------------------------------------'
+ * where Header has the same structure as in allocated block, Previous is
+ * an address of previous free block in free block list (Next is the next one)
+ * and footer stores only the block size.
+ * Free list addresess are the difference between the first block and addressed
+ * block.
  */
 
 #include <assert.h>
@@ -75,7 +99,16 @@ typedef BoundaryTag NodeAddress;
 #define FOOTER_SIZE sizeof(Footer)
 
 typedef MemoryLocation NullableBlock;
+/**
+ * Block without defined structure. It can be initialized and then it becomes a
+ * free block or an allocated block.
+ */
 typedef MemoryLocation RawBlock;
+
+/**
+ * Free and allocated blocks both have header and some bytes. I use this type
+ * when an operation can be performed for both free and allocated block.
+ */
 typedef struct {
   Header header;
   /**
@@ -90,18 +123,20 @@ typedef struct {
   Header header;
   NodeAddress previous;
   NodeAddress next;
-  /**
-   * We don't know what the size of the payload will be, so we will
-   * declare it as a zero-length array.  This allow us to obtain a
-   * pointer to the start of the payload.
-   */
   uint8_t payload[];
-  // As we don't know payload size here, we need to manually get the footer.
+  // As we don't know "payload" size here, we need to manually get the footer.
   // Footer footer;
 } * FreeBlock;
 
 typedef AnyBlock AllocatedBlock;
 
+/**
+ * Block can be any of those variants. All of them have the same external
+ * structure - they are a pointer to a location in memory, but internally they
+ * could differ, so we can use the appropriate variant. There are also contracts
+ * that define properties of those variants, so we can test in assertions that
+ * the given variant has the right structure.
+ */
 typedef union {
   NullableBlock nullable;
   RawBlock raw;
@@ -110,6 +145,9 @@ typedef union {
   AllocatedBlock allocated;
 } Block;
 
+/**
+ * Cursors in free list are in fact free blocks.
+ */
 typedef FreeBlock Cursor;
 
 #ifdef DEBUG
@@ -123,27 +161,52 @@ typedef enum {
 static Block first_block;
 static Block last_block;
 static Word blocks_size;
+
+/**
+ * Free list front and back cursors with their addresses.
+ */
 static Cursor root;
 static NodeAddress root_address;
 static Cursor back;
 static NodeAddress back_address;
+
 debug(static uint32_t verbosity = 0;);
 debug(static uint32_t operation_counter = 1;);
 
+/**
+ * Mask used to extract block size from header and footer.
+ */
 #define BLOCK_SIZE_MASK (-ALIGNMENT)
 
-#define shift_one_left(shift) (0x1 << (shift))
-#define PROPERTIES_SIZE 3
+/**
+ * How many properties we store in header. This is used in property mask
+ * validation.
+ */
+#define PROPERTIES_SIZE 2
 
+/**
+ * Bit positions in header properties mask.
+ */
 #define ALLOCATED_PROPERTY 0
 #define PREVIOUS_ALLOCATED_PROPERTY 1
 
-static const NodeAddress EMPTY_NODE_ADDRESS = 0;
+/**
+ * Address of empty node. The most important fact about this number is that it
+ * has 0 on the lowest bit. If that bit would be 1, then address is not empty.
+ * This is allowed because block addresses are even.
+ */
+#define EMPTY_NODE_ADDRESS 0
 
 #define shift_right(pointer, offset) (void *)(pointer) + (offset)
-
 #define shift_left(pointer, offset) (void *)(pointer) - (offset)
 
+#define shift_one_left(shift) (0x1 << (shift))
+
+/**
+ * Functions used in contract validation. Overall they check if the given
+ * variable has properties of its type. There are also many small functions used
+ * to convert between types.
+ */
 static inline const bool is_property_mask(const Word property_mask) {
   return !(property_mask & (property_mask - 1)) &&
          property_mask <= shift_one_left(PROPERTIES_SIZE - 1);
@@ -262,6 +325,9 @@ static inline const Word round_to_alignment(const Word size) {
   return (size + ALIGNMENT - 1) & BLOCK_SIZE_MASK;
 }
 
+/**
+ * Two-sided conversions between Block and its variants.
+ */
 #define DECLARE_FROM_FUNCTION(name, type)                                      \
   static inline Block from_##name(type name##_block) {                         \
     const Block block = {.name = name##_block};                                \
@@ -591,11 +657,13 @@ static inline const NodeAddress cursor_to_node_address(const Cursor cursor) {
   return address;
 }
 
+#ifdef DEBUG
 static inline const bool test_is_root_cursor(const Cursor cursor) {
   return is_root_cursor(cursor) && is_cursor(cursor) &&
          !is_empty_cursor(cursor) && cursor->previous == EMPTY_NODE_ADDRESS &&
          cursor_to_node_address(cursor) == root_address;
 }
+#endif
 
 static inline void print_cursor(const Cursor cursor) {
   debug_assert(is_cursor(cursor));
@@ -619,10 +687,6 @@ static inline const Cursor new_cursor(const FreeBlock block) {
   return (Cursor)block;
 }
 
-static inline const FreeBlock front() {
-  return root;
-}
-
 static inline const Cursor move_next(const Cursor cursor) {
   debug_assert(is_cursor(cursor));
   const NodeAddress next = cursor->next;
@@ -643,6 +707,9 @@ static inline const FreeBlock current_item(const Cursor cursor) {
   return (FreeBlock)cursor;
 }
 
+/**
+ * Pushes item in front of the free list.
+ */
 static inline void push_front(const FreeBlock item) {
   const Cursor cursor = new_cursor(item);
   if (is_empty_cursor(root)) {
@@ -663,6 +730,9 @@ static inline void push_front(const FreeBlock item) {
   set_root(cursor);
 }
 
+/**
+ * Pushes item on back of the free list.
+ */
 static inline void push_back(const FreeBlock item) {
   const Cursor cursor = new_cursor(item);
   if (is_empty_cursor(root)) {
@@ -673,7 +743,6 @@ static inline void push_back(const FreeBlock item) {
     set_back(cursor);
     return;
   }
-  // debug_assert(test_is_root_cursor(root));
   debug_assert(is_cursor(cursor));
   const NodeAddress address = cursor_to_node_address(cursor);
   debug_assert(is_null_node_address(back->next));
@@ -684,7 +753,7 @@ static inline void push_back(const FreeBlock item) {
 }
 
 /**
- * Removes current element.
+ * Removes item currently focused by cursor from the free lists.
  */
 static inline void remove_current(const Cursor cursor) {
   debug_assert(is_cursor(cursor));
@@ -716,7 +785,6 @@ static inline void remove_current(const Cursor cursor) {
       debug_assert(previous_cursor->next == cursor_to_node_address(cursor));
       previous_cursor->next = EMPTY_NODE_ADDRESS;
       if (is_back_cursor(cursor)) {
-        // debug_assert(test_is_root_cursor(cursor));
         set_back(previous_cursor);
       }
     } else {
@@ -739,6 +807,10 @@ static inline void remove_current(const Cursor cursor) {
     handler;                                                                   \
   }
 
+/**
+ * Implements first-fit policy on free list. Returns null if there is no block
+ * with at least the given size.
+ */
 static inline const FreeBlock find_first_free_node(const BlockSize size) {
   Cursor cursor = root;
   if (is_empty_cursor(cursor)) {
@@ -1039,8 +1111,7 @@ static inline void check_heap(OperationType operation, void *input_payload,
 #endif
 
 /**
- * Allocates new uninitialized block. Returns NULL if allocation
- * fails.
+ * Allocates new block on heap. Returns NULL if allocation fails.
  */
 static inline const RawBlock new_raw_block(const BlockSize size) {
   debug_assert(is_block_size(size));
@@ -1079,6 +1150,7 @@ int mm_init(void) {
   return 0;
 }
 
+#ifdef DEBUG
 /**
  * Finds first free and sufficient block or returns NULL.
  */
@@ -1095,7 +1167,11 @@ static inline const NullableBlock find_first_free_block(const BlockSize size) {
 
   return NULL;
 }
+#endif
 
+/**
+ * Functions used in malloc.
+ */
 static inline const Payload allocate_new_block(const BlockSize size) {
   debug_assert(is_block_size(size));
 
@@ -1241,6 +1317,9 @@ void *malloc(size_t size) {
   return result;
 }
 
+/**
+ * Functions used in free.
+ */
 static inline const Footer *get_previous_footer(const Block block) {
   debug_assert(is_any_block(block));
   debug_assert(is_previous_free(block));
@@ -1346,6 +1425,9 @@ void free(void *ptr) {
   debug(check_heap(FREE, ptr, 0, NULL););
 }
 
+/**
+ * Functions used in realloc.
+ */
 static inline void
 reallocate_shrink_with_split(const AllocatedBlock allocated_block,
                              const BlockSize old_size, const BlockSize size) {
@@ -1543,8 +1625,7 @@ static inline const Payload reallocate(const Payload old_payload,
 }
 
 /**
- * realloc - Change the size of the block by mallocing a new block,
- *      copying its data, and freeing the old block.
+ * realloc
  */
 void *realloc(void *old_ptr, size_t size) {
   /* If size == 0 then this is just free, and we return NULL. */
@@ -1583,7 +1664,7 @@ void *calloc(size_t nmemb, size_t size) {
 }
 
 /*
- * mm_checkheap - So simple, it doesn't need a checker!
+ * mm_checkheap
  */
 void mm_checkheap(int verbose) {
   debug(verbosity = verbose;);
