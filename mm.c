@@ -270,13 +270,6 @@ static inline const bool is_free_block(const __Nullable Block block) {
   return is_any_block(block) && is_free(block);
 }
 
-static inline const bool is_proper_free_block(const FreeBlock block) {
-  const BlockSize size = extract_block_size(block->header);
-  const Footer *footer = shift_right(block, size - FOOTER_SIZE);
-  const Block blk = {.free = block};
-  return is_free_block(blk) && extract_block_size(*footer) == size;
-}
-
 static inline const bool is_allocated_block(const __Nullable Block block) {
   return is_any_block(block) && is_allocated(block);
 }
@@ -617,7 +610,6 @@ static inline const Cursor node_address_to_cursor(const NodeAddress address) {
   const BlockSize offset = extract_block_size(address);
   const RawBlock raw_block = shift_right_block(first_block, offset);
   const Block block = from_raw(raw_block);
-  // debug_trace("%p", raw_block);
   return (Cursor)into_free(block);
 }
 
@@ -636,11 +628,6 @@ static inline void print_cursor(const Cursor cursor) {
   printf("[%p] %x <- %x -> %x\n", cursor, cursor->previous,
          cursor_to_node_address(cursor), cursor->next);
 }
-
-#define trace_cursor(cursor)                                                   \
-  debug_assert(is_cursor(cursor));                                             \
-  debug_trace("[%p] %x <- %x -> %x", cursor, cursor->previous,                 \
-              cursor_to_node_address(cursor), cursor->next);
 
 static inline void set_root(const Cursor cursor) {
   debug_assert(is_cursor(cursor));
@@ -685,7 +672,6 @@ static inline void push_front(const FreeBlock item) {
   if (is_empty_cursor(root)) {
     cursor->next = EMPTY_NODE_ADDRESS;
     cursor->previous = EMPTY_NODE_ADDRESS;
-    // trace_cursor(cursor);
     set_root(cursor);
     return;
   }
@@ -696,8 +682,6 @@ static inline void push_front(const FreeBlock item) {
   root->previous = address;
   cursor->next = root_address;
   cursor->previous = EMPTY_NODE_ADDRESS;
-  // trace_cursor(cursor);
-  // trace_cursor(root);
   set_root(cursor);
 }
 // static inline void pop_front() {
@@ -723,7 +707,6 @@ static inline void remove_current(const Cursor cursor) {
   const NodeAddress previous_address = cursor->previous;
   const NodeAddress next_address = cursor->next;
 
-  // trace_cursor(cursor);
   if (is_null_node_address(previous_address)) {
     if (is_null_node_address(next_address)) {
       debug_assert(cursor == root);
@@ -733,8 +716,6 @@ static inline void remove_current(const Cursor cursor) {
       return;
     } else {
       const Cursor next_cursor = move_next(cursor);
-      // debug_trace("%p %x %x", next_cursor, next_cursor->previous,
-      //             next_cursor->next);
       debug_assert(next_cursor->previous == cursor_to_node_address(cursor));
       next_cursor->previous = EMPTY_NODE_ADDRESS;
       if (is_root_cursor(cursor)) {
@@ -749,12 +730,9 @@ static inline void remove_current(const Cursor cursor) {
       previous_cursor->next = EMPTY_NODE_ADDRESS;
     } else {
       const Cursor previous_cursor = move_previous(cursor);
-      // print_cursor(previous_cursor);
-      // print_cursor(cursor);
       debug_assert(previous_cursor->next == cursor_to_node_address(cursor));
       previous_cursor->next = next_address;
       const Cursor next_cursor = move_next(cursor);
-      // print_cursor(next_cursor);
       debug_assert(next_cursor->previous == cursor_to_node_address(cursor));
       next_cursor->previous = previous_address;
       return;
@@ -762,26 +740,25 @@ static inline void remove_current(const Cursor cursor) {
   }
 }
 
+#define iterate_nodes(cursor, handler)                                         \
+  {                                                                            \
+    for (; !is_null_node_address(cursor->next); cursor = move_next(cursor)) {  \
+      handler;                                                                 \
+    }                                                                          \
+    debug_assert(is_null_node_address(cursor->next));                          \
+    handler;                                                                   \
+  }
+
 static inline const FreeBlock find_first_free_node(const BlockSize size) {
   Cursor cursor = root;
   if (is_empty_cursor(cursor)) {
     return NULL;
   }
 
-  for (; !is_null_node_address(cursor->next); cursor = move_next(cursor)) {
-    const FreeBlock block = current_item(cursor);
+  iterate_nodes(
+    cursor, const FreeBlock block = current_item(cursor);
     const BlockSize item_size = get_free_block_size(block);
-    if (item_size >= size) {
-      return block;
-    }
-  }
-
-  debug_assert(is_null_node_address(cursor->next));
-  const FreeBlock block = current_item(cursor);
-  const BlockSize item_size = get_free_block_size(block);
-  if (item_size >= size) {
-    return block;
-  }
+    if (item_size >= size) { return block; });
 
   return NULL;
 }
@@ -794,17 +771,8 @@ find_node_with_address(const NodeAddress address) {
     return NULL;
   }
 
-  for (; !is_null_node_address(cursor->next); cursor = move_next(cursor)) {
-    if (cursor_to_node_address(cursor) == address) {
-      return cursor;
-    }
-  }
-
-  debug_assert(is_null_node_address(cursor->next));
-  if (cursor_to_node_address(cursor) == address) {
-    return cursor;
-  }
-
+  iterate_nodes(
+    cursor, if (cursor_to_node_address(cursor) == address) { return cursor; });
   return NULL;
 }
 
@@ -813,14 +781,7 @@ static inline void print_nodes() {
   if (is_empty_cursor(cursor)) {
     return;
   }
-
-  for (; !is_null_node_address(cursor->next); cursor = move_next(cursor)) {
-    print_cursor(cursor);
-  }
-
-  debug_assert(is_null_node_address(cursor->next));
-  print_cursor(cursor);
-
+  iterate_nodes(cursor, print_cursor(cursor););
   return;
 }
 #endif
@@ -844,7 +805,6 @@ static inline const FreeBlock initialize_free_block(const RawBlock raw_block,
 
   const FreeBlock free_block = into_free(block);
   // push_front(free_block);
-  debug_assert(is_proper_free_block(free_block));
 
   return free_block;
 }
@@ -1332,7 +1292,6 @@ static inline void deallocate(const Payload payload) {
   if (nullable_next_block != NULL) {
     const Block next_block = from_nullable(nullable_next_block);
     if (is_free(next_block)) {
-      debug_assert(is_proper_free_block(into_free(next_block)));
       remove_current(into_free(next_block));
       block_size += get_block_size(next_block);
 
@@ -1345,10 +1304,8 @@ static inline void deallocate(const Payload payload) {
   }
 
   if (!is_previous_free(block)) {
-    // debug_trace("%p", block.free);
     const FreeBlock free_block = deallocate_allocated_block(allocated_block);
     set_free_block_size(free_block, block_size);
-    debug_assert(is_proper_free_block(free_block));
     push_front(free_block);
     return;
   }
@@ -1363,7 +1320,6 @@ static inline void deallocate(const Payload payload) {
   }
 
   set_free_block_size(free_previous_block, block_size);
-  debug_assert(is_proper_free_block(free_previous_block));
   debug_assert(find_node_with_address(
                  cursor_to_node_address(free_previous_block)) != NULL);
 }
@@ -1412,7 +1368,6 @@ reallocate_shrink_with_split(const AllocatedBlock allocated_block,
     set_previous_allocated(empty_block);
     set_last_block(empty_block);
     push_front(empty_free_block);
-    debug_assert(is_proper_free_block(empty_free_block));
     return;
   }
 
@@ -1424,7 +1379,6 @@ reallocate_shrink_with_split(const AllocatedBlock allocated_block,
     set_previous_allocated(empty_block);
     set_previous_free(next);
     push_front(empty_free_block);
-    debug_assert(is_proper_free_block(empty_free_block));
     return;
   }
 
@@ -1438,7 +1392,6 @@ reallocate_shrink_with_split(const AllocatedBlock allocated_block,
     set_last_block(empty_block);
   }
   push_front(empty_free_block);
-  debug_assert(is_proper_free_block(empty_free_block));
 }
 
 static inline void reallocate_extend_with_split(
@@ -1546,7 +1499,6 @@ static inline const Payload reallocate(const Payload old_payload,
   const Block next = from_nullable(nullable_next);
   if (is_free(next)) {
     const FreeBlock free_next = into_free(next);
-    debug_assert(is_proper_free_block(free_next));
     const BlockSize next_size = get_block_size(next);
 
     if (old_block_size + next_size >= block_size) {
@@ -1609,10 +1561,7 @@ void *realloc(void *old_ptr, size_t size) {
   void *result = reallocate(old_ptr, size);
 
   debug(check_heap(REALLOC, old_ptr, size, result););
-  // print_nodes();
-  // if (operation_counter > 971) {
-  //   print_block(from_free(node_address_to_cursor(0xf7f1)), 0, 5);
-  // }
+
   return result;
 }
 
