@@ -26,7 +26,7 @@
 
 /* If you want debugging output, use the following macro.  When you hand
  * in, remove the #define DEBUG line. */
-#define DEBUG
+// #define DEBUG
 #ifdef DEBUG
 #define debug(statement) statement
 #define debug_msg(...) printf(__VA_ARGS__)
@@ -125,8 +125,8 @@ static Block last_block;
 static Word blocks_size;
 static Cursor root;
 static NodeAddress root_address;
-static Cursor tail;
-static NodeAddress tail_address;
+static Cursor back;
+static NodeAddress back_address;
 debug(static uint32_t verbosity = 0;);
 debug(static uint32_t operation_counter = 1;);
 
@@ -576,6 +576,10 @@ static inline const bool is_root_cursor(const Cursor cursor) {
   return cursor == root;
 }
 
+static inline const bool is_back_cursor(const Cursor cursor) {
+  return cursor == back;
+}
+
 static inline const bool is_cursor(const Cursor cursor) {
   return is_free_block(from_free(cursor));
 }
@@ -625,6 +629,12 @@ static inline void set_root(const Cursor cursor) {
   root_address = cursor_to_node_address(cursor);
 }
 
+static inline void set_back(const Cursor cursor) {
+  debug_assert(is_cursor(cursor));
+  back = cursor;
+  back_address = cursor_to_node_address(cursor);
+}
+
 static inline const Cursor new_cursor(const FreeBlock block) {
   return (Cursor)block;
 }
@@ -656,9 +666,11 @@ static inline const FreeBlock current_item(const Cursor cursor) {
 static inline void push_front(const FreeBlock item) {
   const Cursor cursor = new_cursor(item);
   if (is_empty_cursor(root)) {
+    debug_assert(is_empty_cursor(back));
     cursor->next = EMPTY_NODE_ADDRESS;
     cursor->previous = EMPTY_NODE_ADDRESS;
     set_root(cursor);
+    set_back(cursor);
     return;
   }
   debug_assert(test_is_root_cursor(root));
@@ -669,6 +681,26 @@ static inline void push_front(const FreeBlock item) {
   cursor->next = root_address;
   cursor->previous = EMPTY_NODE_ADDRESS;
   set_root(cursor);
+}
+
+static inline void push_back(const FreeBlock item) {
+  const Cursor cursor = new_cursor(item);
+  if (is_empty_cursor(root)) {
+    debug_assert(is_empty_cursor(back));
+    cursor->next = EMPTY_NODE_ADDRESS;
+    cursor->previous = EMPTY_NODE_ADDRESS;
+    set_root(cursor);
+    set_back(cursor);
+    return;
+  }
+  // debug_assert(test_is_root_cursor(root));
+  debug_assert(is_cursor(cursor));
+  const NodeAddress address = cursor_to_node_address(cursor);
+  debug_assert(is_null_node_address(back->next));
+  back->next = address;
+  cursor->next = EMPTY_NODE_ADDRESS;
+  cursor->previous = back_address;
+  set_back(cursor);
 }
 
 /**
@@ -687,6 +719,8 @@ static inline void remove_current(const Cursor cursor) {
       debug_assert(test_is_root_cursor(root));
       root = NULL;
       root_address = EMPTY_NODE_ADDRESS;
+      back = NULL;
+      back_address = EMPTY_NODE_ADDRESS;
     } else {
       const Cursor next_cursor = move_next(cursor);
       debug_assert(next_cursor->previous == cursor_to_node_address(cursor));
@@ -701,6 +735,10 @@ static inline void remove_current(const Cursor cursor) {
       const Cursor previous_cursor = move_previous(cursor);
       debug_assert(previous_cursor->next == cursor_to_node_address(cursor));
       previous_cursor->next = EMPTY_NODE_ADDRESS;
+      if (is_back_cursor(cursor)) {
+        // debug_assert(test_is_root_cursor(cursor));
+        set_back(previous_cursor);
+      }
     } else {
       const Cursor previous_cursor = move_previous(cursor);
       debug_assert(previous_cursor->next == cursor_to_node_address(cursor));
@@ -804,7 +842,7 @@ static inline const FreeBlock initialize_free_block(const RawBlock raw_block,
   set_free_raw_block_size(raw_block, size);
 
   const FreeBlock free_block = into_free(block);
-  push_front(free_block);
+  push_back(free_block);
 
   return free_block;
 }
@@ -1057,6 +1095,8 @@ int mm_init(void) {
   blocks_size = 0;
   root = NULL;
   root_address = EMPTY_NODE_ADDRESS;
+  back = NULL;
+  back_address = EMPTY_NODE_ADDRESS;
 
   return 0;
 }
@@ -1082,7 +1122,7 @@ static inline const Payload allocate_new_block(const BlockSize size) {
   debug_assert(is_block_size(size));
 
   // if (is_small_size(size)) {
-    
+
   // }
 
   const RawBlock raw_block = new_raw_block(size);
@@ -1273,7 +1313,7 @@ deallocate_allocated_block(AllocatedBlock allocated_block) {
   const Block block = from_allocated(allocated_block);
   set_free(block);
   const FreeBlock free_block = into_free(block);
-  push_front(free_block);
+  push_back(free_block);
   return free_block;
 }
 
