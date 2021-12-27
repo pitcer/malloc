@@ -588,8 +588,7 @@ static inline const bool is_empty_cursor(const Cursor cursor) {
 }
 
 static inline const bool is_root_cursor(const Cursor cursor) {
-  return !is_empty_cursor(cursor) && cursor == root &&
-         cursor->previous == EMPTY_NODE_ADDRESS;
+  return cursor == root;
 }
 
 static inline const bool is_cursor(const Cursor cursor) {
@@ -623,6 +622,12 @@ static inline const NodeAddress cursor_to_node_address(const Cursor cursor) {
   return address;
 }
 
+static inline const bool test_is_root_cursor(const Cursor cursor) {
+  return is_root_cursor(cursor) && is_cursor(cursor) &&
+         !is_empty_cursor(cursor) && cursor->previous == EMPTY_NODE_ADDRESS &&
+         cursor_to_node_address(cursor) == root_address;
+}
+
 static inline void print_cursor(const Cursor cursor) {
   debug_assert(is_cursor(cursor));
   printf("[%p] %x <- %x -> %x\n", cursor, cursor->previous,
@@ -643,9 +648,9 @@ static inline const FreeBlock front() {
   return root;
 }
 
-static inline const FreeBlock back() {
-  return NULL;
-}
+// static inline const FreeBlock back() {
+//   return NULL;
+// }
 
 static inline const Cursor move_next(const Cursor cursor) {
   debug_assert(is_cursor(cursor));
@@ -675,7 +680,7 @@ static inline void push_front(const FreeBlock item) {
     set_root(cursor);
     return;
   }
-  debug_assert(is_cursor(root));
+  debug_assert(test_is_root_cursor(root));
   debug_assert(is_cursor(cursor));
   const NodeAddress address = cursor_to_node_address(cursor);
   debug_assert(is_null_node_address(root->previous));
@@ -711,17 +716,18 @@ static inline void remove_current(const Cursor cursor) {
     if (is_null_node_address(next_address)) {
       debug_assert(cursor == root);
       debug_assert(cursor_to_node_address(cursor) == root_address);
+      debug_assert(test_is_root_cursor(cursor));
+      debug_assert(test_is_root_cursor(root));
       root = NULL;
       root_address = EMPTY_NODE_ADDRESS;
-      return;
     } else {
       const Cursor next_cursor = move_next(cursor);
       debug_assert(next_cursor->previous == cursor_to_node_address(cursor));
       next_cursor->previous = EMPTY_NODE_ADDRESS;
       if (is_root_cursor(cursor)) {
+        debug_assert(test_is_root_cursor(cursor));
         set_root(next_cursor);
       }
-      return;
     }
   } else {
     if (is_null_node_address(next_address)) {
@@ -735,10 +741,31 @@ static inline void remove_current(const Cursor cursor) {
       const Cursor next_cursor = move_next(cursor);
       debug_assert(next_cursor->previous == cursor_to_node_address(cursor));
       next_cursor->previous = previous_address;
-      return;
     }
   }
 }
+
+// const Cursor item_cursor = new_cursor(item);
+// const NodeAddress item_address = cursor_to_node_address(item_cursor);
+// item_cursor->next = EMPTY_NODE_ADDRESS;
+// item_cursor->previous = EMPTY_NODE_ADDRESS;
+
+// if (!is_null_node_address(previous_address)) {
+//   const Cursor previous_cursor = move_previous(cursor);
+//   previous_cursor->next = item_address;
+//   item_cursor->previous = previous_address;
+// }
+
+// if (!is_null_node_address(next_address)) {
+//   const Cursor next_cursor = move_next(cursor);
+//   next_cursor->previous = item_address;
+//   item_cursor->next = next_address;
+// }
+
+// if (is_root_cursor(cursor)) {
+//   debug_assert(test_is_root_cursor(cursor));
+//   set_root(item_cursor);
+// }
 
 #define iterate_nodes(cursor, handler)                                         \
   {                                                                            \
@@ -783,6 +810,32 @@ static inline void print_nodes() {
   }
   iterate_nodes(cursor, print_cursor(cursor););
   return;
+}
+
+static inline bool nodes_double_contains(const NodeAddress address) {
+  Cursor cursor = root;
+  if (is_empty_cursor(cursor)) {
+    return false;
+  }
+  bool found = false;
+
+  iterate_nodes(
+    cursor, if (cursor_to_node_address(cursor) == address) {
+      if (found) {
+        return true;
+      }
+      found = true;
+    });
+  return false;
+}
+
+static inline bool find_duplicates() {
+  Cursor cursor = root;
+  if (is_empty_cursor(cursor)) {
+    return false;
+  }
+  iterate_nodes(cursor, nodes_double_contains(cursor_to_node_address(cursor)););
+  return false;
 }
 #endif
 
@@ -951,6 +1004,8 @@ static inline void check_invariants() {
     //       find_node_with_address(cursor_to_node_address(free_block)) !=
     //       NULL);
     //   });
+
+    // find_duplicates();
   }
 }
 
@@ -1102,8 +1157,6 @@ allocate_new_block(const BlockSize size) {
 static inline const AllocatedBlock
 allocate_free_block(const FreeBlock free_block) {
   const Block block = from_free(free_block);
-  // TODO: if there is a new free block introduced, use "replace" function
-  // remove_current(free_block);
   set_allocated(block);
   return into_allocated(block);
 }
@@ -1134,12 +1187,6 @@ static inline const __Nullable Payload allocate_to_extended_last_block(
 static inline const Payload allocate_with_split(const FreeBlock free_block,
                                                 const BlockSize size) {
   const Block block = from_free(free_block);
-#ifdef DEBUG
-  if (operation_counter > 900) {
-    print_nodes();
-    print_block(block, 0, 4);
-  }
-#endif
   // We call this function on first free block, so previous must be allocated.
   debug_assert(is_previous_allocated(block));
   debug_assert(is_block_size(size));
@@ -1147,11 +1194,6 @@ static inline const Payload allocate_with_split(const FreeBlock free_block,
   const BlockSize old_block_size = get_block_size(block);
   const BlockSize empty_block_size = old_block_size - size;
   debug_assert(is_block_size(empty_block_size));
-
-  remove_current(free_block);
-  const AllocatedBlock allocated_block = allocate_free_block(free_block);
-
-  const Payload payload = get_payload(allocated_block);
 
   // Block is too small to split, its size stays the same.
   if (empty_block_size < MINIMUM_BLOCK_SIZE) {
@@ -1161,10 +1203,10 @@ static inline const Payload allocate_with_split(const FreeBlock free_block,
       set_previous_allocated(from_any(next));
     }
 
-    return payload;
+    remove_current(free_block);
+    const AllocatedBlock allocated_block = allocate_free_block(free_block);
+    return get_payload(allocated_block);
   }
-
-  set_allocated_block_size(allocated_block, size);
 
   const RawBlock empty_raw_block = shift_right_block(block, size);
 
@@ -1179,9 +1221,14 @@ static inline const Payload allocate_with_split(const FreeBlock free_block,
   if (is_last_block(block)) {
     set_last_block(empty_block);
   }
-  push_front(empty_free_block);
 
-  return payload;
+  remove_current(free_block);
+  push_front(empty_free_block);
+  // replace_current(free_block, empty_free_block);
+  const AllocatedBlock allocated_block = allocate_free_block(free_block);
+  set_allocated_block_size(allocated_block, size);
+
+  return get_payload(allocated_block);
 }
 
 static inline const Payload allocate(const UnalignedPayloadSize size) {
